@@ -165,6 +165,12 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
     { cwd: destinationDir, stdio: "inherit" },
   );
+  // The staged copy is already built and lacks the monorepo around it, so pack-time
+  // lifecycle scripts (e.g. server prepack -> ../scripts/...) cannot run here.
+  // release.sh packs with --ignore-scripts; git installs run plain `npm pack`.
+  if (publishManifest.scripts) {
+    for (const hook of ["prepack", "prepare", "postpack"]) delete publishManifest.scripts[hook];
+  }
   writeFileSync(deployedPackagePath, `${JSON.stringify(publishManifest, null, 2)}\n`);
   applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot);
 
