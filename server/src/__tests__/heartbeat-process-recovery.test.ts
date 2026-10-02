@@ -1740,6 +1740,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
   });
 
+  it.each([false, true])("a handoff wake outlasts the lease release of the run it interrupted (interruptedRunId: %s)", async withInterrupted => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", runStatus: "interrupted" });
+    await db.update(heartbeatRuns).set({ resultJson: { conversationContinuation: "continue_conversation_v1" } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
+    const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId, status: "active" }).returning();
+    // The interrupted run's finalizer releases its lease only after the handoff
+    // request has already woken the next owner.
+    const released = new Promise<void>((resolve, reject) => setTimeout(() => {
+      db.update(environmentLeases).set({ releasedAt: new Date(), status: "released" })
+        .where(eq(environmentLeases.id, lease!.id)).then(() => resolve(), reject);
+    }, 300));
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "execution_review_requested",
+      payload: { issueId, ...(withInterrupted ? { interruptedRunId: runId } : {}) },
+      contextSnapshot: { issueId },
+    });
+    await released;
+    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
+    const lost = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "execution_reconciliation_required"),
+    ));
+    expect(lost).toHaveLength(withInterrupted ? 0 : 1);
+    expect(Boolean(run)).toBe(withInterrupted);
+  });
+
   it("waits for a terminal predecessor's environment lease to be released", async () => {
     const { companyId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", runStatus: "interrupted" });
     await db.update(heartbeatRuns).set({ resultJson: { conversationContinuation: "continue_conversation_v1" } }).where(eq(heartbeatRuns.id, runId));

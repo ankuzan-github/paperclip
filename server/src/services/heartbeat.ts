@@ -36,7 +36,7 @@ import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
-import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
@@ -904,6 +904,8 @@ const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
+const INTERRUPTED_RUN_RELEASE_WAIT_MS = 10_000;
+const INTERRUPTED_RUN_RELEASE_POLL_MS = 100;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = [
   "scheduled_retry",
   "queued",
@@ -26786,6 +26788,18 @@ export function heartbeatService(
     }
   }
 
+  // A handoff cancels the previous run and wakes the next owner in one request,
+  // while that run's finalizer releases its lease milliseconds later. Admitted
+  // earlier, the wake becomes an execution-wait receipt that nothing replays,
+  // and the task idles until a watchdog. Past the bound, admission decides as before.
+  async function awaitInterruptedRunRelease(companyId: string, issueId: string, runId: string) {
+    const deadline = Date.now() + INTERRUPTED_RUN_RELEASE_WAIT_MS;
+    while ((await getConversationOwnershipBlocker(db, companyId, issueId))?.runId === runId) {
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, INTERRUPTED_RUN_RELEASE_POLL_MS));
+    }
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -26831,6 +26845,8 @@ export function heartbeatService(
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const interruptedRunId = readNonEmptyString(payload.interruptedRunId);
+    if (issueId && interruptedRunId) await awaitInterruptedRunRelease(agent.companyId, issueId, interruptedRunId);
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
