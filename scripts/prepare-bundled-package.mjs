@@ -1,13 +1,30 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+function readWorkspaceVersions(sourceRoot) {
+  const versions = {};
+  const dirs = ["server", "ui", "cli"];
+  for (const parent of ["packages", "packages/adapters", "packages/plugins", "packages/plugins/examples"]) {
+    const parentDir = resolve(sourceRoot, parent);
+    if (!existsSync(parentDir)) continue;
+    for (const entry of readdirSync(parentDir)) dirs.push(`${parent}/${entry}`);
+  }
+  for (const dir of dirs) {
+    const manifestPath = resolve(sourceRoot, dir, "package.json");
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.name && manifest.version) versions[manifest.name] = manifest.version;
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, workspaceVersions = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,7 +39,7 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        return [name, `${prefix}${workspaceVersions[name] ?? pkg.version}`];
       }),
     );
   }
@@ -156,7 +173,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, readWorkspaceVersions(sourceRoot));
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
