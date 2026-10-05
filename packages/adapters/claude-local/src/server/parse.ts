@@ -203,22 +203,30 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+function isClaudeStreamEventLine(line: string): boolean {
+  if (!line.startsWith("{")) return false;
+  const event = parseJson(line);
+  return event !== null && typeof event.type === "string";
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The legacy login-prompt markers match the CLI's own words: stderr, plain
+  // stdout lines, and the terminal fields of a failed run. A stream-json event
+  // line carries tool output and model text, so a file the agent reads that
+  // says "unauthorized" must not mark a healthy run as login required.
+  const terminalText =
+    parsed !== null && claudeResultIndicatesAuthFailure(parsed) ? collectClaudeTerminalText(parsed) : "";
+  const promptLines = [terminalText, input.stdout, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => line && !isClaudeStreamEventLine(line));
   const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
 
   // The token-failure markers match only against the parsed terminal fields of

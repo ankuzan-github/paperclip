@@ -134,6 +134,51 @@ describe("detectClaudeLoginRequired", () => {
     expect(isClaudeTransientUpstreamError(input)).toBe(true);
   });
 
+  it("does not classify a login word inside a stream-json tool result as login required", () => {
+    // A healthy run read a reference file that says "unauthorized recipients".
+    // The word lands in a stream-json user event, which is tool output, not the CLI.
+    const toolResult = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", content: "The server rejects unknown or unauthorized recipients." }],
+      },
+    });
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { is_error: false, subtype: "success", result: "done" },
+        stdout: toolResult,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+    expect(
+      detectClaudeLoginRequired({ parsed: null, stdout: toolResult, stderr: "" }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("does not classify a successful result that mentions a login word as login required", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { is_error: false, subtype: "success", result: "The endpoint answers 401 Unauthorized as expected." },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("classifies the CLI login prompt in a failed result event as login required", () => {
+    const result = { type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login" };
+    expect(
+      detectClaudeLoginRequired({ parsed: result, stdout: JSON.stringify(result), stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies a plain-text login prompt on stdout as login required", () => {
+    expect(
+      detectClaudeLoginRequired({ parsed: null, stdout: "Not logged in · Please run /login", stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
   it("does not treat a bare token phrase in raw stdout with no parsed result as login required", () => {
     // Untrusted stdout alone must not satisfy a token-failure marker. Only the
     // parsed terminal result fields of a failed run can trip the token markers.

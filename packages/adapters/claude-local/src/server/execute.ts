@@ -1192,7 +1192,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
-      : loginMeta.requiresLogin
+      // A run whose result event succeeded reached the model, so it was
+      // authenticated whatever the output text says.
+      : failed && loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
         parsed,
