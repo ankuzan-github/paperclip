@@ -4570,7 +4570,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ? retryScheduledNow.isPending
     : checkIssueMonitorNow.isPending;
   const checkWaitingSurfaceError = waitingSurfaceIsScheduledRetry
-    ? retryScheduledNow.error?.message
+    ? (retryScheduledNow.error as Error | null)?.message
     : checkIssueMonitorNow.error?.message;
 
   const approvalDecision = useMutation({
