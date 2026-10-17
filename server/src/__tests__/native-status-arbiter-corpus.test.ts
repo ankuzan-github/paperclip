@@ -848,8 +848,12 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
         completionState === "kill_switch_during_active_native_run"
         && (fixture.covers.migrationRows ?? []).includes("MIG-08")
       ) {
+        const experimentalAdapterConfig = {
+          provider: "opencode",
+          model: "openrouter/deepseek/deepseek-v4-flash-0731",
+        };
         const runtimeConfig = {
-          nativeRunner: { mode: "native", backend: "codex_app_server", protocolVersion: 1 },
+          nativeRunner: { mode: "native", backend: "opencode_server", protocolVersion: 1 },
         };
         const enabled = options.disableLiveEntrypoint === "rollout";
         const activeResolution = resolveHeartbeatNativeRuntimeMode({
@@ -860,7 +864,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
           },
           enabled,
           runtimeConfig,
-          adapterConfig: { provider: "codex" },
+          adapterConfig: experimentalAdapterConfig,
           agent: { id: agentId, status: "running", adapterType: "paperclip_runner" },
           issue: { id: seeded.issueId, workMode: "standard" },
           target: { kind: "local" },
@@ -873,7 +877,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
             persisted: { runtimeMode: null, runtimeModeReason: null, runtimeModeResolvedAt: null },
             enabled,
             runtimeConfig,
-            adapterConfig: { provider: "codex" },
+            adapterConfig: experimentalAdapterConfig,
             agent: { id: agentId, status: "running", adapterType: "paperclip_runner" },
             issue: { id: seeded.issueId, workMode: "standard" },
             target: { kind: "local" },
@@ -1818,7 +1822,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     };
   }
 
-  it("executes all 53 fixtures in their production consumers and joins all 70 matrix rows", async () => {
+  it("executes all 53 fixtures, joins all 70 matrix rows, and rejects mutated comparison fields", async () => {
     expect(corpus.schema).toBe("paperclip.status-authority-conformance.v1");
     expect(corpus.fixtures).toHaveLength(53);
 
@@ -1865,11 +1869,6 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
           .toBe(requiredConsumerForMatrixRow(result.matrixRow));
       }
     }
-  }, 60_000);
-
-  it("fails independently when any asserted field category is mutated", async () => {
-    const observations = new Map<string, FixtureObservation>();
-    for (const fixture of corpus.fixtures) observations.set(fixture.id, await executeFixture(fixture));
 
     for (const fixture of corpus.fixtures) {
       const observed = observations.get(fixture.id)!;
@@ -2905,6 +2904,39 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.issueId, seeded.issueId));
     expect(effects.filter((effect) => effect.effectKind === "enqueue_continuation")).toEqual([expect.objectContaining({ targetId: wake!.id, targetType: "agent_wakeup_request" })]);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, key))).toHaveLength(1);
+  });
+
+  it.each(["scheduled", "cleared", "replaced", "reassigned"] as const)("revalidates a %s monitor under the final disposition lock", async (state) => {
+    const template = corpus.fixtures.find(candidate => candidate.mode === "native")!;
+    const fixture = { ...template, id: `monitor-commit-${state}`, given: { ...template.given, priorIssueStatus: "in_progress" } };
+    const seeded = await seedFixture(fixture);
+    const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
+    const currentCheck = state === "replaced" ? new Date(Date.now() + 120_000).toISOString() : nextCheckAt;
+    await db.update(issues).set({
+      executionRunId: seeded.runId, checkoutRunId: seeded.runId,
+      assigneeAgentId: state === "reassigned" ? null : agentId,
+      monitorNextCheckAt: state === "cleared" ? null : new Date(currentCheck),
+      executionPolicy: state === "cleared" ? null : { monitor: { nextCheckAt: currentCheck, notes: "Check again" } },
+    }).where(eq(issues.id, seeded.issueId));
+    const decision: NativeStatusDecision = { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: "in_progress", reasonCode: "scheduled_monitor_waiting",
+      unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
+    const commit = () => commitNativeStatusDecision({ db, companyId, issueId: seeded.issueId, runId: seeded.runId,
+      assessmentId: seeded.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+      decision, requireMonitorWait: { agentId, nextCheckAt } });
+    if (state !== "scheduled") {
+      await expect(commit()).rejects.toThrow("native_status_race");
+      expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, seeded.issueId))).toHaveLength(0);
+    } else {
+      await commit();
+      expect((await commit()).replayed).toBe(true);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+      expect(issue).toMatchObject({ status: "in_progress", checkoutRunId: null, executionRunId: null });
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt);
+      const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.issueId, seeded.issueId));
+      expect(effects.map(effect => effect.effectKind)).toEqual(["release_checkout"]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).filter(wake => wake.payload?.issueId === seeded.issueId)).toHaveLength(0);
+    }
   });
 
   it("fails the transaction closed for an unknown status effect", async () => {

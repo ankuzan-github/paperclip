@@ -11,6 +11,10 @@ import type {
   FeedbackTrace,
   FeedbackVote,
   Issue,
+  IssueAccessGrant,
+  IssueAccessGrantSubjectType,
+  IssueVisibility,
+  IssuePrivacyConstraints,
   IssueChanges,
   IssueAttachment,
   IssueCostSummary,
@@ -98,6 +102,8 @@ export type IssueListFilters = {
   originId?: string;
   descendantOf?: string;
   createdFromIssueId?: string;
+  includeAgentCreatedTasks?: boolean;
+  includeParticipatedTasks?: boolean;
   includeRoutineExecutions?: boolean;
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
@@ -139,6 +145,9 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.originId) params.set("originId", filters.originId);
   if (filters?.descendantOf) params.set("descendantOf", filters.descendantOf);
   if (filters?.createdFromIssueId) params.set("createdFromIssueId", filters.createdFromIssueId);
+  if (filters?.includeParticipatedTasks) params.set("includeParticipatedTasks", "true");
+  if (filters?.includeAgentCreatedTasks !== undefined)
+    params.set("includeAgentCreatedTasks", String(filters.includeAgentCreatedTasks));
   if (filters?.includeRoutineExecutions)
     params.set("includeRoutineExecutions", "true");
   if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");
@@ -274,15 +283,20 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  resumeWorkspaceFinalization: (id: string, data: { actionId: string; runId: string; ownerToken: string; controllerAndCopybackStopped: true; stopEvidence: string }) =>
+    api.post<{ runId: string; resultId: string; status: "queued" }>(`/issues/${id}/recovery-actions/resume-workspace-finalization`, data),
   retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
     api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
+  recoveryActions: (id: string) =>
+    api.get<{ active: IssueRecoveryAction | null; actions: IssueRecoveryAction[] }>(`/issues/${id}/recovery-actions`),
   resolveRecoveryAction: (
     id: string,
     data: {
       executionReconciliation?: ExecutionReconciliation;
+      workspaceBaseRef?: { requestedRef: string; branch: string };
       actionId?: string;
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      sourceIssueStatus: Issue["status"];
       resolutionNote?: string | null;
     },
   ) =>
@@ -589,8 +603,24 @@ export const issuesApi = {
       form,
     );
   },
-  deleteAttachment: (id: string) =>
-    api.delete<{ ok: true }>(`/attachments/${id}`),
+  deleteAttachment: (id: string) => api.delete<{ ok: true }>(`/attachments/${id}`),
+  // --- Privacy / sharing (PAP-16066) -------------------------------------
+  // Enriched grants for the share sheet: implicit-by-source rows (assignment /
+  // project) plus explicit grants, each carrying subjectDisplayName / avatar /
+  // agentVisibility from the server enrichment pass.
+  privacyConstraints: (id: string) => api.get<IssuePrivacyConstraints>(`/issues/${id}/privacy-constraints`),
+  listAccessGrants: (id: string, options?: RequestOptions) =>
+    options
+      ? api.get<IssueAccessGrant[]>(`/issues/${id}/access-grants`, options)
+      : api.get<IssueAccessGrant[]>(`/issues/${id}/access-grants`),
+  createAccessGrant: (
+    id: string,
+    data: { subjectType: IssueAccessGrantSubjectType; subjectId: string },
+  ) => api.post<IssueAccessGrant>(`/issues/${id}/access-grants`, data),
+  revokeAccessGrant: (id: string, grantId: string) =>
+    api.post<IssueAccessGrant>(`/issues/${id}/access-grants/${grantId}/revoke`, {}),
+  setVisibility: (id: string, visibility: IssueVisibility) =>
+    api.patch<IssueUpdateResponse>(`/issues/${id}`, { visibility }),
   listApprovals: (id: string) => api.get<Approval[]>(`/issues/${id}/approvals`),
   linkApproval: (id: string, approvalId: string) =>
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
