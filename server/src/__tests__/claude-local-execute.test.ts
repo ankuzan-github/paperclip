@@ -74,6 +74,8 @@ const payload = {
   paperclipApiUrl: process.env.PAPERCLIP_API_URL || null,
   paperclipApiKey: process.env.PAPERCLIP_API_KEY || null,
   paperclipApiBridgeMode: process.env.PAPERCLIP_API_BRIDGE_MODE || null,
+  disableBackgroundTasks: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null,
+  bashMaxTimeoutMs: process.env.BASH_MAX_TIMEOUT_MS ?? null,
 };
 if (capturePath) {
   fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
@@ -484,6 +486,51 @@ describe("claude execute", () => {
       expect(zero.mcpConfigPath).toBeNull();
       expect(zero.mcpConfigContents).toBeNull();
       expect(alpha.mcpConfigPath).toContain("/agents/agent-alpha/");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // A background task cannot outlive the heartbeat: the adapter stops it after
+  // the terminal result and the run fails with no durable continuation.
+  it("withholds background task tools from the CLI unless the agent env opts back in", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-no-background-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    try {
+      const run = async (runId: string, extraEnv: Record<string, string>) => {
+        await execute({
+          runId,
+          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            engine: "cli",
+            command: commandPath,
+            cwd: workspace,
+            env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath, ...extraEnv },
+            promptTemplate: "Do work.",
+          },
+          context: {},
+          authToken: "tok",
+          onLog: async () => {},
+        });
+        return JSON.parse(await fs.readFile(capturePath, "utf8"));
+      };
+
+      const defaults = await run("run-default", {});
+      expect(defaults.disableBackgroundTasks).toBe("1");
+      expect(defaults.bashMaxTimeoutMs).toBe("3600000");
+      const disallowedIndex = defaults.argv.indexOf("--disallowedTools");
+      expect(disallowedIndex).toBeGreaterThanOrEqual(0);
+      expect(defaults.argv[disallowedIndex + 1]).toBe("Monitor");
+
+      const optedIn = await run("run-opt-in", {
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "0",
+        BASH_MAX_TIMEOUT_MS: "600000",
+      });
+      expect(optedIn.disableBackgroundTasks).toBe("0");
+      expect(optedIn.bashMaxTimeoutMs).toBe("600000");
+      expect(optedIn.argv).not.toContain("--disallowedTools");
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });

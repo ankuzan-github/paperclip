@@ -159,6 +159,21 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
+// A background task cannot outlive the heartbeat: once the terminal result
+// arrives the adapter stops the process, the run fails with no durable
+// continuation, and the work the task was doing is lost. So the CLI gets no
+// background tools, and long commands get room to run in the foreground.
+// Agent env may override either key; a falsy kill switch also restores Monitor.
+const CLAUDE_FOREGROUND_ONLY_ENV: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+  BASH_MAX_TIMEOUT_MS: "3600000",
+};
+
+function backgroundTasksDisabled(env: Record<string, string>) {
+  const value = (env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? "").trim().toLowerCase();
+  return value !== "" && value !== "0" && value !== "false";
+}
+
 function isBedrockAuth(env: Record<string, string>): boolean {
   return (
     env.CLAUDE_CODE_USE_BEDROCK === "1" ||
@@ -219,7 +234,10 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
 
   const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent, input.agentIdentity) };
+  const env: Record<string, string> = {
+    ...buildPaperclipEnv(agent, input.agentIdentity),
+    ...CLAUDE_FOREGROUND_ONLY_ENV,
+  };
   env.PAPERCLIP_RUN_ID = runId;
 
   const wakeTaskId =
@@ -878,6 +896,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
     args.push("--add-dir", effectivePromptBundleAddDir);
+    if (backgroundTasksDisabled(env)) args.push("--disallowedTools", "Monitor");
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
