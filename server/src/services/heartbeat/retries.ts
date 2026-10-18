@@ -455,12 +455,31 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               opts?.random,
             )
           : null;
-    const baseSchedule = computedBaseSchedule
-      ? { ...computedBaseSchedule, maxAttempts }
-      : null;
     const transientRecovery =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
+        : null;
+    // A quota reset is a known resumption point that earlier failures in the
+    // chain cannot have spent; without it the task strands until a human wakes
+    // it. One grant per chain, carried forward in the retry context.
+    const providerQuotaResetAt =
+      !computedBaseSchedule &&
+      transientRecovery?.errorFamily === "provider_quota" &&
+      transientRecovery.retryNotBefore &&
+      transientRecovery.retryNotBefore.getTime() > now.getTime() &&
+      parseObject(run.contextSnapshot).providerQuotaResetRetryGranted !== true
+        ? transientRecovery.retryNotBefore
+        : null;
+    const baseSchedule = computedBaseSchedule
+      ? { ...computedBaseSchedule, maxAttempts }
+      : providerQuotaResetAt
+        ? {
+            attempt: nextAttempt,
+            baseDelayMs: 0,
+            delayMs: providerQuotaResetAt.getTime() - now.getTime(),
+            dueAt: providerQuotaResetAt,
+            maxAttempts: nextAttempt,
+          }
         : null;
     const codexTransientFallbackMode =
       agent.adapterType === "codex_local" &&
@@ -657,6 +676,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         ...(transientRecovery
           ? { errorFamily: transientRecovery.errorFamily }
           : {}),
+          ...(providerQuotaResetAt ? { providerQuotaResetRetryGranted: true } : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
         ...(transientRetryNotBefore
@@ -1268,6 +1288,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         ...(transientRecovery
           ? { errorFamily: transientRecovery.errorFamily }
           : {}),
+          ...(providerQuotaResetAt ? { providerQuotaResetRetryGranted: true } : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
         baseDelayMs: schedule.baseDelayMs,

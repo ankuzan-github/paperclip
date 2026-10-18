@@ -2111,6 +2111,81 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
   });
 
+  // Earlier failures in the chain can spend the 30-second budget before the
+  // provider quota hits; the reset time is still a known resumption point.
+  it("grants one reset-time retry to a provider quota failure after the failure budget is spent", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+    const resetAt = new Date("2026-04-22T16:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      adapterType: "claude_local",
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      resultJson: {
+        conversationContinuation: "continue_conversation_v1",
+        errorFamily: "provider_quota",
+        retryNotBefore: resetAt.toISOString(),
+        transientRetryNotBefore: resetAt.toISOString(),
+      },
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Quota fixture", status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, runId));
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.getTime()).toBe(resetAt.getTime());
+
+    const retryRun = await heartbeat.getRun(scheduled.run.id);
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerQuotaResetRetryGranted).toBe(true);
+
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      errorCode: "provider_quota",
+      finishedAt: resetAt,
+      resultJson: {
+        conversationContinuation: "continue_conversation_v1",
+        errorFamily: "provider_quota",
+        retryNotBefore: "2026-04-23T16:00:00.000Z",
+        transientRetryNotBefore: "2026-04-23T16:00:00.000Z",
+      },
+    }).where(eq(heartbeatRuns.id, scheduled.run.id));
+
+    expect(await heartbeat.scheduleBoundedRetry(scheduled.run.id, { now: resetAt, random: () => 0.5 }))
+      .toMatchObject({ outcome: "retry_exhausted" });
+  });
+
+  it("keeps an exhausted provider quota failure exhausted when its reset time is unknown", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-22T10:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      adapterType: "claude_local",
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+    });
+
+    expect(await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 }))
+      .toMatchObject({ outcome: "retry_exhausted" });
+  });
+
   it("schedules bounded retries for claude_transient_upstream and honors its retry-not-before hint", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
