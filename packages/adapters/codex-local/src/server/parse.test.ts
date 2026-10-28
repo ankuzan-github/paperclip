@@ -240,6 +240,16 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  it("extracts a dated retry time when the reset falls on another day", () => {
+    const errorMessage = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 28th, 2026 12:32 AM.";
+    const now = new Date(2026, 9, 27, 22, 9, 30);
+
+    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+      new Date(2026, 9, 28, 0, 32, 0, 0).getTime(),
+    );
+  });
+
   it("classifies model-capacity messages as provider quota without reset metadata", () => {
     const errorMessage = "The requested model is at capacity. Please try again later.";
 

@@ -278,8 +278,25 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const MONTH_INDEX: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+// A reset past midnight comes with its date ("Oct 28th, 2026 12:32 AM"); an
+// unparsed date drops the whole clock and the quota retries as transient.
+function splitLeadingDate(clockText: string): { date: { year: number | null; month: number; day: number } | null; rest: string } {
+  const match = clockText.match(/^([a-z]{3})[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?,?(?:\s+(\d{4}))?,?\s+(.*)$/i);
+  const month = match ? MONTH_INDEX[(match[1] ?? "").toLowerCase()] : undefined;
+  if (!match || month === undefined) return { date: null, rest: clockText };
+  return {
+    date: { year: match[3] ? Number.parseInt(match[3], 10) : null, month, day: Number.parseInt(match[2] ?? "", 10) },
+    rest: match[4] ?? "",
+  };
+}
+
 function parseLocalClockTime(clockText: string, now: Date): Date | null {
-  const normalized = clockText.trim();
+  const { date, rest } = splitLeadingDate(clockText.trim());
+  const normalized = rest.trim();
   const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?$/i);
   if (!match) return null;
 
@@ -303,6 +320,11 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
   }
 
   const retryAt = new Date(now);
+  if (date) {
+    retryAt.setFullYear(date.year ?? now.getFullYear(), date.month, date.day);
+    retryAt.setHours(hour24, minute, 0, 0);
+    return retryAt;
+  }
   retryAt.setHours(hour24, minute, 0, 0);
   if (retryAt.getTime() <= now.getTime()) {
     retryAt.setDate(retryAt.getDate() + 1);
