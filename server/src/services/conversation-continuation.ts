@@ -151,13 +151,22 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       if (leases.every(lease => lease.provider !== "local")) continue;
     }
     let pidAlive = run.processPid !== null && processMayBeAlive(run.processPid);
+    let pidRecycled = false;
     if (pidAlive && run.processStartedAt) {
       // A recycled PID cannot keep an old task blocked. An unreadable identity
       // stays conservative; the original process may still own execution.
       const observed = await readProcessStartedAt(run.processPid!).catch(() => null);
-      if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) pidAlive = false;
+      if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) {
+        pidAlive = false;
+        pidRecycled = true;
+      }
     }
-    const groupAlive = run.processGroupId !== null && processMayBeAlive(-run.processGroupId);
+    // The kernel never hands out a PID still used as a process-group id, so a
+    // recycled leader PID proves the original group is gone; the live group is
+    // the newcomer's own.
+    const groupAlive = run.processGroupId !== null
+      && !(pidRecycled && run.processGroupId === run.processPid)
+      && processMayBeAlive(-run.processGroupId);
     if (pidAlive || groupAlive || leaseHeld) {
       return {
         runId: run.id,

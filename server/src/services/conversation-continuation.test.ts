@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
@@ -59,6 +60,20 @@ describePostgres("execution identity query contracts", () => {
     expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: legacy.id });
     await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, legacy.id));
     expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+  it("releases a run whose recycled leader PID now leads an unrelated process group", async () => {
+    const f = await fixture();
+    const stranger = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { detached: true, stdio: "ignore" });
+    try {
+      const pid = stranger.pid!;
+      const legacy = await run(f, { issueId: f.issueId }, null, pid);
+      await db.update(heartbeatRuns).set({ processGroupId: pid }).where(eq(heartbeatRuns.id, legacy.id));
+      expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: legacy.id });
+      await db.update(heartbeatRuns).set({ processStartedAt: new Date(Date.now() - 3_600_000) }).where(eq(heartbeatRuns.id, legacy.id));
+      expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+    } finally {
+      stranger.kill("SIGKILL");
+    }
   });
   it("delivers canonical same-company task IDs and keeps malformed IDs private", async () => {
     const f = await fixture(), foreign = await fixture();
