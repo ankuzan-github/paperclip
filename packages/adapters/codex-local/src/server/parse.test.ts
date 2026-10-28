@@ -181,6 +181,21 @@ describe("classifyCodexAuthRefreshFailure", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "chatgpt wham api returned 401" })).toBeNull();
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "You've hit your usage limit for GPT-5." })).toBeNull();
   });
+
+  it("ignores auth wording the agent read or wrote and keeps the quota verdict", () => {
+    const stdout = [
+      JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "if (res.status === 401) await refreshAccessToken(); // invalid refresh token → unauthorized" } }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Missing bearer now returns 401 Unauthorized." } }),
+      JSON.stringify({ type: "turn.failed", error: { message: "You’ve hit your usage limit. try again at 2:02 PM." } }),
+    ].join("\n");
+    const errorMessage = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 2:02 PM.";
+
+    expect(classifyCodexAuthRefreshFailure({ stdout, errorMessage })).toBeNull();
+    expect(isCodexProviderQuotaError({ stdout, errorMessage })).toBe(true);
+    expect(classifyCodexAuthRefreshFailure({
+      stdout: JSON.stringify({ type: "item.completed", item: { type: "error", message: "OAuth failed: invalid_grant" } }),
+    })).toBe("refresh_token_invalidated");
+  });
 });
 
 describe("isCodexUnknownSessionError", () => {

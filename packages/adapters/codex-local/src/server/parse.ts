@@ -144,14 +144,31 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
+// Work items echo whatever the agent read or wrote (source files, logs, its own
+// prose); a "401" or "refresh token" there is not Codex failing, and reading it
+// as such parks the task behind a reconnect card instead of a quota wait.
+function isCodexWorkItemLine(line: string): boolean {
+  if (!line.startsWith("{")) return false;
+  try {
+    const event = JSON.parse(line) as { type?: unknown; item?: { type?: unknown } };
+    return typeof event.type === "string" && event.type.startsWith("item.") && event.item?.type !== "error";
+  } catch {
+    return false;
+  }
+}
+
 function buildCodexErrorHaystack(input: {
   stdout?: string | null;
   stderr?: string | null;
   errorMessage?: string | null;
 }): string {
+  const stdout = (input.stdout ?? "")
+    .split(/\r?\n/)
+    .filter((line) => !isCodexWorkItemLine(line.trim()))
+    .join("\n");
   return [
     input.errorMessage ?? "",
-    input.stdout ?? "",
+    stdout,
     input.stderr ?? "",
   ]
     .join("\n")
