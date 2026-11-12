@@ -255,6 +255,28 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  it.each([0, 15_000, 59_999])("retries within a minute when the local reset minute is still current (%i ms)", (elapsedMs) => {
+    const reset = new Date(2026, 10, 12, 17, 12);
+    const now = new Date(reset.getTime() + elapsedMs);
+    const errorMessage = "You’ve hit your usage limit. try again at 5:12 PM.";
+
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(now.getTime() + 60_000);
+  });
+
+  it.each([0, 15_000, 59_999])("retries within a minute when an explicit timezone reset minute is current (%i ms)", (elapsedMs) => {
+    const now = new Date(Date.parse("2026-11-12T15:12:00Z") + elapsedMs);
+    const errorMessage = "You’ve hit your usage limit. try again at 5:12 PM (Asia/Nicosia).";
+
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(now.getTime() + 60_000);
+  });
+
+  it("keeps next-day clocks beyond the current reset minute", () => {
+    const errorMessage = "You’ve hit your usage limit. try again at 12:01 AM.";
+    const now = new Date(2026, 10, 12, 23, 59, 30);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(new Date(2026, 10, 13, 0, 1).getTime());
+    expect(extractCodexRetryNotBefore({ errorMessage: errorMessage.replace("AM.", "AM (Asia/Nicosia).") }, new Date("2026-11-12T21:59:30Z"))?.toISOString()).toBe("2026-11-12T22:01:00.000Z");
+  });
+
   it("extracts a dated retry time when the reset falls on another day", () => {
     const errorMessage = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 28th, 2026 12:32 AM.";
     const now = new Date(2026, 9, 27, 22, 9, 30);

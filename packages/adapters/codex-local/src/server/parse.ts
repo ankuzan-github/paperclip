@@ -260,6 +260,15 @@ function dateFromTimeZoneWallClock(input: {
   return candidate;
 }
 
+// A reset clock has minute precision. A failure within that minute may still
+// precede the actual reset; retry shortly instead of parking it for another day.
+function retryAfterResetMinute(retryAt: Date, now: Date): Date {
+  const elapsedMs = now.getTime() - retryAt.getTime();
+  return elapsedMs >= 0 && elapsedMs < 60_000
+    ? new Date(now.getTime() + 60_000)
+    : retryAt;
+}
+
 function nextClockTimeInTimeZone(input: {
   now: Date;
   hour: number;
@@ -279,6 +288,7 @@ function nextClockTimeInTimeZone(input: {
     timeZone,
   });
   if (!retryAt) return null;
+  retryAt = retryAfterResetMinute(retryAt, input.now);
 
   if (retryAt.getTime() <= input.now.getTime()) {
     const nextDay = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day + 1, 0, 0, 0, 0));
@@ -343,6 +353,8 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
     return retryAt;
   }
   retryAt.setHours(hour24, minute, 0, 0);
+  const minuteRetryAt = retryAfterResetMinute(retryAt, now);
+  if (minuteRetryAt !== retryAt) return minuteRetryAt;
   if (retryAt.getTime() <= now.getTime()) {
     retryAt.setDate(retryAt.getDate() + 1);
   }
