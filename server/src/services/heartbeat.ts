@@ -1329,6 +1329,10 @@ export function heartbeatService(
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
+    resumeStoppedUserComments: async (companyId, runId, queueId) => {
+      const run = await getRun(runId);
+      if (run?.companyId === companyId) await resumeRemoteStopComments(run, queueId);
+    },
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
     executeRun,

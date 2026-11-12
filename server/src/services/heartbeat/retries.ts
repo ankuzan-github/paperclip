@@ -5,6 +5,7 @@ import { notifyAttentionRetentionWork } from "../retention-work-notifications.js
 import { normalizeAgentNameKey } from "../agent-name-key.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
+import { reconcileProviderLimitWaits } from "./provider-limit-wait.js";
 import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
 import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
@@ -1822,6 +1823,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
 
   async function promoteDueScheduledRetries(now = new Date()) {
     const cutoff = await getWorktreeExecutionCutoff();
+    await reconcileProviderLimitWaits(db, now, cutoff);
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,

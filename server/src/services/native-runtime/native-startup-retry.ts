@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, ne, or, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { readProviderFailure, type ProviderFailure } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
 import { infrastructureRetryDelayMs, PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js";
@@ -44,6 +44,7 @@ export type AgentProviderLimitCooldown = {
 export async function agentProviderLimitCooldown(db: Db, input: {
   companyId: string;
   agentId: string;
+  adapterType?: string;
   /** Excluded from the evidence; the caller supplies its own failure. */
   runId?: string;
   failure?: ProviderFailure | null;
@@ -64,6 +65,14 @@ export async function agentProviderLimitCooldown(db: Db, input: {
     .where(and(
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId),
+      ...(input.adapterType ? [sql`coalesce(
+        ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType',
+        (select ${heartbeatRunEvents.payload}->>'adapterType' from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
+            and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+            and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
+          order by ${heartbeatRunEvents.seq} desc limit 1),
+        ${input.adapterType}) = ${input.adapterType}`] : []),
       gte(heartbeatRuns.startedAt, new Date(now - NATIVE_PROVIDER_LIMIT_WINDOW_MS)),
       ...(input.runId ? [ne(heartbeatRuns.id, input.runId)] : []),
       or(

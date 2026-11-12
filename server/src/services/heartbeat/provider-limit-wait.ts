@@ -1,5 +1,9 @@
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { and, eq, gt, gte, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_POOL_WAIT_RETRY_REASON } from "../../modules/run-dispatch/index.js";
 import { agentProviderLimitCooldown } from "../native-runtime/native-startup-retry.js";
@@ -7,6 +11,43 @@ import { parseObject } from "../../adapters/utils.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
+
+export async function reconcileProviderLimitWaits(db: Db, now: Date, cutoff: Date | null) {
+  const source = alias(heartbeatRuns, "provider_limit_source");
+  const candidates = await db.select({ run: { id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    agentId: heartbeatRuns.agentId, wakeupRequestId: heartbeatRuns.wakeupRequestId,
+    scheduledRetryAt: heartbeatRuns.scheduledRetryAt }, adapterType: agents.adapterType }).from(heartbeatRuns)
+    .innerJoin(source, and(eq(source.companyId, heartbeatRuns.companyId), eq(source.id, heartbeatRuns.retryOfRunId),
+      eq(source.errorCode, "provider_limit_wait")))
+    .innerJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
+    .where(and(eq(heartbeatRuns.status, "scheduled_retry"),
+      eq(heartbeatRuns.scheduledRetryReason, AI_CONNECTION_POOL_WAIT_RETRY_REASON),
+      gt(heartbeatRuns.scheduledRetryAt, now), cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined));
+  const cooling = new Map<string, boolean>();
+  for (const { run, adapterType } of candidates) {
+    const key = `${run.companyId}:${run.agentId}:${adapterType}`;
+    if (!cooling.has(key)) cooling.set(key, Boolean(await agentProviderLimitCooldown(db, {
+      companyId: run.companyId, agentId: run.agentId, now, adapterType })));
+    if (cooling.get(key)) continue;
+    await db.transaction(async tx => {
+      await notifyScheduledRetryDispatch(tx, { companyId: run.companyId });
+      const [updated] = await tx.update(heartbeatRuns).set({ scheduledRetryAt: now, updatedAt: now,
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ||
+          ${JSON.stringify({ scheduledRetryAt: now.toISOString() })}::jsonb`,
+      }).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "scheduled_retry"), eq(heartbeatRuns.scheduledRetryAt, run.scheduledRetryAt!))).returning({ id: heartbeatRuns.id });
+      if (updated && run.wakeupRequestId) await tx.update(agentWakeupRequests).set({ updatedAt: now,
+        payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) ||
+          ${JSON.stringify({ scheduledRetryAt: now.toISOString() })}::jsonb`,
+      }).where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, run.wakeupRequestId)));
+      if (updated) await appendHeartbeatRunEvent(tx as unknown as Db, { companyId: run.companyId,
+        agentId: run.agentId, runId: run.id, eventType: "lifecycle", stream: "system", level: "info",
+        message: "The provider allowance wait no longer applies to the current adapter",
+        payload: { adapterType, previousRetryAt: run.scheduledRetryAt!.toISOString(), retryAt: now.toISOString() },
+      });
+    });
+  }
+}
 
 export interface ProviderLimitWaitDependencies {
   setRunStatusIfRunning: (runId: string, status: "cancelled", patch: {
@@ -48,6 +89,7 @@ export function createProviderLimitWait(db: Db, deps: ProviderLimitWaitDependenc
     const now = new Date();
     const cooldown = await agentProviderLimitCooldown(db, {
       companyId: run.companyId, agentId: run.agentId, runId: run.id, now,
+      adapterType: agent.adapterType,
     }).catch((err: unknown) => {
       // Missing evidence must not stop work; the provider still reports its own limit.
       logger.warn({ err, runId: run.id }, "provider limit evidence unavailable before dispatch");

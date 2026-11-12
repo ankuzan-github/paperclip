@@ -245,6 +245,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   resumeExecutionWaitComments: (scope?: DeferredReceiptRecoveryOptions) => Promise<unknown>;
   resumeQueuedCommentInterrupt: (companyId: string, queueId: string) => Promise<unknown>;
   resumeSavedLegacyComments: (companyId: string, queueId: string) => Promise<unknown>;
+  resumeStoppedUserComments: (companyId: string, runId: string, queueId: string) => Promise<unknown>;
   formatIssueIdentifierLink: (identifier: string | null, fallback: string) => string;
 }
 
@@ -431,6 +432,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
+    resumeStoppedUserComments,
     cancelActiveForAgentInternal,
     listCompanyAgentOrgRows,
     executeRun,
@@ -2004,6 +2006,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const releaseSource = `${latest.companyId}:${String(wake.payload?.issueId)}:${latest.id}:${latest.sourceVersion}`;
       if (latest.runtimeMode === "native" && releasedNativeSources.has(releaseSource)) continue;
       if (latest.runtimeMode === "legacy") {
+        if (latest.status === "cancelled" && !latest.startedAt) {
+          await resumeStoppedUserComments(wake.companyId, latest.id, wake.id);
+        }
         const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
           latest.errorCode === "execution_reconciliation_required";
         if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {

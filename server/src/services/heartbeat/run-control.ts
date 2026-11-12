@@ -56,6 +56,7 @@ import {
 } from "../explicit-native-continuation.js";
 import { isCancelledNativeStartup, isInterruptedNativePreparation } from "../cancelled-native-startup.js";
 import { settleInterruptedNativeBootstrap, recordInterruptedPreparationContinuation } from "../legacy-execution-recovery.js";
+import { isNeverStartedDispatchCancellation } from "../pre-dispatch-review-wait.js";
 import {
   executionBlockerPredicate,
   getExecutionBlocker,
@@ -593,7 +594,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         )) : [];
     const cancelledPreparation = run.runtimeMode === "legacy" &&
       await isCancelledNativeStartup(db, run, preparationCoordinator);
+    const unstartedCancellation = run.status === "cancelled" && run.startedAt === null &&
+      await isNeverStartedDispatchCancellation(db, run);
     if (run.runtimeMode !== "native" && !cancelledPreparation && !interruptedPreparation &&
+        !unstartedCancellation &&
         parseObject(run.resultJson?.startupCancellation).beforeNativeSelection !== true &&
         !(await remoteExecutionHasStopped(db, run.companyId, run.id)) &&
         !(await recordedLocalExecutionStopped(db, run))) return;
@@ -613,7 +617,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
-      hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson) &&
+      (unstartedCancellation || hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson)) &&
       !(await getExecutionBlocker(db, run.companyId, issueId));
     if (run.runtimeMode !== "native" && run.runtimeMode !== "legacy") return;
     const pending = await db.select().from(agentWakeupRequests).where(and(
@@ -658,7 +662,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       let commentId = deriveCommentId(context, payload);
       let requestedByActorId = wake.requestedByActorId;
       const reason = readNonEmptyString(context.wakeReason) ?? wake.reason;
-      if (run.runtimeMode === "native" || cancelledPreparation) {
+      if (run.runtimeMode === "native" || cancelledPreparation || unstartedCancellation) {
         const ids = await undeliveredLegacyUserCommentIds(db, run.companyId, issueId, run.agentId,
           queuedCommentIdsFromWakePayload(payload));
         if (!ids.length) continue;
@@ -667,10 +671,16 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         commentId = ids.at(-1)!;
         // A coalesced queue can contain several authors. Its saved comments,
         // not the outer wake's first author, authorize the remaining input.
-        const [author] = await db.select({ id: issueComments.authorUserId }).from(issueComments).where(and(
-          eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId), eq(issueComments.id, commentId),
-        ));
+        const [author] = await db.select({ id: issueComments.authorUserId, commentId: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
+          unstartedCancellation ? inArray(issueComments.id, ids) : eq(issueComments.id, commentId),
+        )).orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
         requestedByActorId = author?.id ?? null;
+        if (unstartedCancellation && author) {
+          commentId = author.commentId;
+          context = { ...context, wakeCommentId: commentId, commentId };
+          payload = { ...payload, commentId };
+        }
       }
       if (legacyContinuation || stoppedNativeContinuation) {
         if (!commentId || !run.finishedAt || !requestedByActorId ||

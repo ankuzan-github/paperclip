@@ -37,6 +37,7 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { alias } from "drizzle-orm/pg-core";
+import { settleUnstartedLegacyCancellations } from "./legacy-execution-recovery.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 /**
@@ -544,6 +545,7 @@ export async function settleUnrecoverableExecutions(
   now = new Date(),
   options: { failpoint?: (phase: "persisted") => void } = {},
 ) {
+  await settleUnstartedLegacyCancellations(db);
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = obsoleteExecutionConversationHold();

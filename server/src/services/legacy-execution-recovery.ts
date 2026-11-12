@@ -5,7 +5,7 @@ import { notifyInstructionCollection } from "./instruction-collection-notificati
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
-import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
+import { isPreDispatchReviewWaitVerified, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE, REMOTE_WORKSPACE_RESTORE_FAILED_CODE } from "./remote-workspace-transport.js";
 import { REUSABLE_SANDBOX_RESUME_FAILED_CODE } from "./reusable-sandbox-resume-error.js";
@@ -480,10 +480,16 @@ export async function settleCancelledLegacyPreparation(
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
       )),
     )).for("update");
-    const ownedBlock = holds.map(hold => hold.evidence.legacyCancellationBlock as Record<string, unknown> | undefined)
-      .find(receipt => receipt?.runId === run.id && receipt.statusVersion === task.statusVersion &&
-        ["todo", "in_progress", "in_review"].includes(String(receipt.previousStatus)));
-    if (task.status === "blocked" && ownedBlock && task.assigneeAgentId === run.agentId &&
+    const ownedHold = holds.find(hold => {
+      const receipt = hold.evidence.legacyCancellationBlock as Record<string, unknown> | undefined;
+      return receipt?.runId === run.id && receipt.statusVersion === task.statusVersion &&
+        ["todo", "in_progress", "in_review"].includes(String(receipt.previousStatus));
+    });
+    const ownedBlock = ownedHold?.evidence.legacyCancellationBlock as Record<string, unknown> | undefined;
+    const review = parseIssueExecutionState(task.executionState);
+    const currentReviewer = ownedHold?.returnOwnerAgentId === task.assigneeAgentId && review?.status === "pending" &&
+      review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
+    if (task.status === "blocked" && ownedBlock && (task.assigneeAgentId === run.agentId || currentReviewer) &&
         !isSupersededConversationRun(task, run) && !task.executionRunId && !task.checkoutRunId) {
       // Restore only the unchanged projection made by this exact incident.
       await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx);
@@ -504,6 +510,28 @@ export async function settleCancelledLegacyPreparation(
     }
     return settled;
   });
+}
+
+export async function settleUnstartedLegacyCancellations(db: Db) {
+  const candidates = await db.selectDistinct({ run: heartbeatRuns }).from(heartbeatRuns)
+    .innerJoin(issueRecoveryActions, and(
+      eq(issueRecoveryActions.companyId, heartbeatRuns.companyId),
+      sql`${issueRecoveryActions.evidence}->>'runId' = ${heartbeatRuns.id}::text`,
+      eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+      sql`${issueRecoveryActions.fingerprint} = 'legacy-execution:' || ${heartbeatRuns.id}::text`,
+      sql`${issueRecoveryActions.sourceIssueId}::text = ${heartbeatRuns.contextSnapshot}->>'issueId'`,
+      sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
+      or(inArray(issueRecoveryActions.status, ["active", "escalated"]), and(
+        eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      )),
+    ))
+    .where(and(eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->'executionRecovery' is null`,
+      sql`${heartbeatRuns.resultJson}->'cancellation'->'expected' = 'true'::jsonb`,
+      eq(heartbeatRuns.errorCode, "cancelled"), neverStartedDispatchCancellationPredicate()))
+    .limit(25);
+  for (const { run } of candidates) await settleCancelledLegacyPreparation(db, { run, providerDispatchStarted: false });
 }
 
 /** Capture the required-file obligation before unrelated host writes. Keeps

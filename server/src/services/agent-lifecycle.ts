@@ -3,7 +3,7 @@ import { notifyBudgetResumeAgentReady } from "./budget-resume-continuation.js";
 import { currentControllerProcessStamp } from "./controller-process-identity.js";
 import { notifyStrandedAgentStatus } from "./live-run-recovery-notifications.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
-import { notifyRunDispatch } from "./run-dispatch-notifications.js";
+import { notifyScheduledRetryDispatch } from "./run-dispatch-notifications.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyNativeReviewResponse } from "./native-review-response-notifications.js";
 import { isAgentStatusInvokable } from "@paperclipai/shared";
@@ -61,7 +61,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
       await notifyAttentionRetentionWork(tx, { companyId });
       if (before !== after) {
         await notifyStrandedAgentStatus(tx, { companyId, agentId });
-        await notifyRunDispatch(tx, { companyId });
+        await notifyScheduledRetryDispatch(tx, { companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
       }

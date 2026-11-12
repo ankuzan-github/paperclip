@@ -4,6 +4,20 @@ Infrastructure recovery belongs to the system. A task shows one working state,
 one scheduled retry, or an ordinary **Retry** action. Approval, credentials,
 assignment, budget and deliberate pause remain separate user decisions.
 
+Legacy provider-allowance waits use the adapter recorded by the failed run,
+including historical invocation evidence. A limit from another adapter does not
+park the current adapter. Existing parked waits are rechecked on scheduler
+startup and agent lifecycle changes; ordinary dispatch still applies current
+authorization, pause, budget and review gates. Native provider and account
+changes retain their existing cooldown contract.
+
+Cancelling a legacy retry before any dispatch, process, session, allocation or
+output was recorded creates no unknown provider actions. Recovery rechecks old
+false holds with the same proof and restores only their unchanged task-status
+projection, including a pending review by a separate reviewer. The Stop remains
+effective: only a saved user request sent after it can start a new turn. Old
+queued input and ambiguous execution evidence do not restart work by themselves.
+
 ## Admission and execution
 
 `POST /api/issues/:id/retry` accepts `{ idempotencyKey, observedRunId }`.

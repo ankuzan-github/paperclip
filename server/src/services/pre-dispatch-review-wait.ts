@@ -1,9 +1,10 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { executionStartedEventPredicate, noRetainedExecutionPredicate } from "./pre-dispatch-execution-evidence.js";
 import type { QueuedRunStalenessErrorCode } from "../modules/run-dispatch/index.js";
+import { readRunCancellation } from "./run-cancellation.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "processGroupId" |
@@ -32,10 +33,25 @@ const staleDispatchErrorCodes = Object.entries(staleDispatchReconciliationExempt
 export function neverStartedDispatchCancellationPredicate() {
   return and(
     eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "cancelled"),
-    inArray(heartbeatRuns.errorCode, staleDispatchErrorCodes),
+    or(inArray(heartbeatRuns.errorCode, staleDispatchErrorCodes), and(
+      eq(heartbeatRuns.errorCode, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->'cancellation'->'expected' = 'true'::jsonb`,
+      sql`(${heartbeatRuns.usageJson} is null or ${heartbeatRuns.usageJson} = '{}'::jsonb)`,
+      sql`coalesce(${heartbeatRuns.stdoutExcerpt}, '') = '' and coalesce(${heartbeatRuns.stderrExcerpt}, '') = ''`,
+      sql`${heartbeatRuns.lastOutputAt} is null and ${heartbeatRuns.lastOutputSeq} = 0 and coalesce(${heartbeatRuns.lastOutputBytes}, 0) = 0`,
+      sql`${heartbeatRuns.logStore} is null and ${heartbeatRuns.logRef} is null
+        and ${heartbeatRuns.logSha256} is null and coalesce(${heartbeatRuns.logBytes}, 0) = 0`,
+    )),
     isNotNull(heartbeatRuns.finishedAt),
     noRetainedExecutionPredicate(),
   );
+}
+
+export async function isNeverStartedDispatchCancellation(db: Db, run: Pick<Run, "id" | "companyId">): Promise<boolean> {
+  const [verified] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id), neverStartedDispatchCancellationPredicate(),
+  )).limit(1);
+  return Boolean(verified);
 }
 
 /** The queued-run gate owns this receipt before execution authority is claimed.
@@ -70,7 +86,8 @@ export function isPreDispatchReviewWait(
  * checked against the same evidence that gates explicit user admission. */
 export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
   if (run.runtimeMode === "legacy" && run.status === "cancelled" && run.finishedAt !== null &&
-      staleDispatchErrorCodes.some(errorCode => errorCode === run.errorCode) &&
+      (staleDispatchErrorCodes.some(errorCode => errorCode === run.errorCode) ||
+        run.errorCode === "cancelled" && readRunCancellation(run.resultJson)?.expected === true) &&
       [run.startedAt, run.runtimeModeResolvedAt, run.processPid, run.processGroupId, run.processStartedAt,
         run.nativeIssueId, run.nativeSessionId, run.sessionIdAfter, run.controllerBootId,
         run.controllerLeaseExpiresAt, run.executionStage].every(value => value === null) &&

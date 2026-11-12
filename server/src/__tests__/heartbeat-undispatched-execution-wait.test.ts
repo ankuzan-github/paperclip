@@ -10,6 +10,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
+import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("undispatched execution waits", () => {
@@ -73,6 +75,82 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId)))[0])
       .toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+  });
+
+  it.each([{ fresh: true, reordered: false }, { fresh: true, reordered: true }, { fresh: false, reordered: false }])(
+    "delivers only fresh user input after cancelling an unstarted scheduled retry ($fresh, reordered: $reordered)", async ({ fresh, reordered }) => {
+    const f = await seed(true);
+    const [run] = await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: {
+      cancellation: { expected: true, source: "operator", initiator: { type: "user", id: "board" },
+        reason: "Cancel the parked retry", recordedAt: f.run.finishedAt!.toISOString() },
+      startupCancellation: { beforeNativeSelection: false },
+      executionCancellation: { state: "requested" },
+    } }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run)).toBe(false);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const { queueId, commentIds } = await saveMessages(f);
+    const deliveryIds = reordered ? commentIds.toReversed() : commentIds;
+    if (reordered) {
+      await db.update(issueComments).set({ createdAt: new Date(f.run.finishedAt!.getTime() - 1000) })
+        .where(eq(issueComments.id, commentIds[0]));
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(saved.payload, deliveryIds) })
+        .where(eq(agentWakeupRequests.id, queueId));
+    }
+    if (!fresh) await db.update(issueComments).set({ createdAt: new Date(f.run.finishedAt!.getTime() - 1000) })
+      .where(and(eq(issueComments.companyId, f.companyId), eq(issueComments.issueId, f.issueId)));
+    await heartbeatService(db).resumeQueuedRuns();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    const queued = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(queued).toHaveLength(fresh ? 1 : 0);
+    if (fresh) {
+      expect(queued[0].contextSnapshot).toMatchObject({ wakeCommentIds: deliveryIds });
+      expect(receipt.runId).toBe(queued[0].id);
+    } else expect(receipt.status).toBe("deferred_issue_execution");
+  });
+
+  it.each([false, true])("repairs the exact historical cancellation projection and preserves pending review (separate owner: %s)", async separateOwner => {
+    const f = await seed(true);
+    const ownerId = separateOwner ? randomUUID() : f.agentId;
+    if (separateOwner) await db.insert(agents).values({ id: ownerId, companyId: f.companyId,
+      name: "Implementer", adapterType: "claude_local", status: "idle" });
+    await db.update(heartbeatRuns).set({ errorCode: "cancelled", resultJson: {
+      cancellation: { expected: true, source: "operator", initiator: { type: "user", id: "board" },
+        reason: "Cancel the parked retry", recordedAt: f.run.finishedAt!.toISOString() },
+      startupCancellation: { beforeNativeSelection: false },
+      executionCancellation: { state: "requested" },
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    const executionState = { status: "pending", currentParticipant: { type: "agent", agentId: f.agentId },
+      currentStageType: "review", currentStageId: randomUUID(), currentStageIndex: 0,
+      completedStageIds: [], returnAssignee: { type: "agent", agentId: ownerId },
+      lastDecisionId: null, lastDecisionOutcome: null };
+    const [task] = await db.update(issues).set({ status: "blocked", executionState, assigneeAgentId: ownerId })
+      .where(eq(issues.id, f.issueId)).returning();
+    await db.update(issueRecoveryActions).set({ fingerprint: `legacy-execution:${f.runId}`,
+      returnOwnerAgentId: ownerId, evidence: { runId: f.runId,
+        legacyCancellationBlock: { runId: f.runId, statusVersion: task.statusVersion, previousStatus: "in_review" },
+        automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+      } }).where(eq(issueRecoveryActions.id, f.actionId));
+    await settleUnrecoverableExecutions(db);
+    const [restored] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(restored).toMatchObject({ status: "in_review", executionState });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it.each([
+    { usageJson: { outputTokens: 12 } }, { stdoutExcerpt: "Provider already performed work" },
+    { lastOutputAt: new Date(), lastOutputBytes: 10, lastOutputSeq: 1 }, { logBytes: 10 },
+    { logStore: "file", logRef: "/retained/provider-output.jsonl", logBytes: null },
+  ])("retains cancelled execution with positive provider evidence: %j", async evidence => {
+    const f = await seed(true);
+    const [run] = await db.update(heartbeatRuns).set({ ...evidence, errorCode: "cancelled", resultJson: {
+      cancellation: { expected: true, source: "operator", initiator: { type: "user", id: "board" },
+        reason: "Cancel the parked retry", recordedAt: f.run.finishedAt!.toISOString() },
+    } }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run)).toBe(true);
+    await settleUnrecoverableExecutions(db);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
   });
 
   it("resumes all saved messages once through normal admission after restart", async () => {

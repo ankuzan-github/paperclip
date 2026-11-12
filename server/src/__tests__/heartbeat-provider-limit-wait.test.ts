@@ -194,4 +194,50 @@ describePostgres("heartbeat provider usage limit wait", () => {
       retryability: "unknown", message: "ACP agent reported a terminal limit failure." } } }]);
     expect(dispatched.has((await wake(unrelated)).id)).toBe(true);
   }, 60_000);
+
+  it("does not apply a previous adapter's allowance to the current adapter", async () => {
+    const f = await seed([{ ...rateLimited(5),
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+    }]);
+    const finished = await wake(f);
+    expect(dispatched.has(finished.id)).toBe(true);
+    expect(finished.status).toBe("succeeded");
+  }, 60_000);
+
+  it("keeps the allowance wait for the same recorded adapter", async () => {
+    const f = await seed([{ ...rateLimited(5),
+      runnerProfileJson: { adapterDispatch: { adapterType } },
+    }]);
+    const finished = await wake(f);
+    expect(dispatched.has(finished.id)).toBe(false);
+    expect(finished.errorCode).toBe("provider_limit_wait");
+  }, 60_000);
+
+  it("automatically resumes a parked wait after switching adapters", async () => {
+    const f = await seed([{ ...rateLimited(5),
+      runnerProfileJson: { adapterDispatch: { adapterType } },
+    }]);
+    const finished = await wake(f);
+    const [retry] = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)))
+      .filter(run => run.status === "scheduled_retry");
+    expect(retry).toBeDefined();
+    expect(retry.scheduledRetryAt!.getTime()).toBeGreaterThan(Date.now());
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    registerServerAdapter({ type: "claude_local", supportsLocalAgentJwt: false,
+      execute: async input => {
+        dispatched.add(input.runId);
+        await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, String(input.context.issueId)));
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+      },
+      testEnvironment: async () => ({ adapterType: "claude_local", status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      expect((await heartbeat.promoteDueScheduledRetries()).runIds).toContain(retry.id);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(dispatched.has(retry.id)).toBe(true);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id)))[0].status).toBe("succeeded");
+      expect(dispatched.has(finished.id)).toBe(false);
+    } finally { unregisterServerAdapter("claude_local"); }
+  }, 60_000);
 });
