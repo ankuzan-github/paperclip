@@ -123,6 +123,43 @@ describe("service adapter dispatch", () => {
 });
 
 describe("launchd lifecycle", () => {
+  it.each(["install", "restart"])("preserves the saved command search path during %s", async operation => {
+    const userHome = await temporaryDirectory();
+    const savedPath = `${userHome}/custom & tools:${userHome}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin`;
+    const runner: CommandRunner = async () => ({ stdout: "", stderr: "" });
+    const manager = new LaunchdServiceManager("team-a", runner, path.join(userHome, ".paperclip"),
+      path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition().replace(/<key>PATH<\/key><string>[^<]*<\/string>/, "").replace(
+      "<key>PAPERCLIP_HOME</key>", `<key>PATH</key><string>${savedPath.replaceAll("&", "&amp;")}</string>\n<key>PAPERCLIP_HOME</key>`,
+    ));
+    if (operation === "install") await manager.install({ startNow: true, startOnLogin: true });
+    else await manager.restart();
+    const installed = await fs.readFile(manager.definitionPath, "utf8");
+    expect(installed).toContain(`<key>PATH</key><string>${savedPath.replaceAll("&", "&amp;")}</string>`);
+    expect(manager.renderDefinition()).toBe(installed);
+  });
+
+  it("gives a new service stable user and Homebrew command directories", async () => {
+    const userHome = await temporaryDirectory();
+    const runner: CommandRunner = async () => ({ stdout: "", stderr: "" });
+    const manager = new LaunchdServiceManager("team-a", runner, path.join(userHome, ".paperclip"),
+      path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await manager.install({ startNow: false, startOnLogin: false });
+    const installed = await fs.readFile(manager.definitionPath, "utf8");
+    expect(installed).toContain(`<key>PATH</key><string>${userHome}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>`);
+  });
+
+  it("keeps user commands available when the managed shim is global", async () => {
+    const userHome = await temporaryDirectory();
+    const runner: CommandRunner = async () => ({ stdout: "", stderr: "" });
+    const manager = new LaunchdServiceManager("team-a", runner, path.join(userHome, ".paperclip"),
+      "/usr/local/bin/paperclipai", userHome);
+    await manager.install({ startNow: false, startOnLogin: false });
+    expect(await fs.readFile(manager.definitionPath, "utf8"))
+      .toContain(`<key>PATH</key><string>${userHome}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>`);
+  });
+
   it("starts without changing the saved login preference", async () => {
     const userHome = await temporaryDirectory();
     const calls: string[] = [];

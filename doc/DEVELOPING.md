@@ -850,6 +850,11 @@ owns committed updates.
 
 ## Hot-Restart Deploys
 
+On macOS, managed service installation and restart preserve the saved launchd
+`PATH`. New definitions include the managed shim directory, Homebrew and system
+command directories. The invoking shell's environment is not copied into the
+service definition.
+
 During a restart, the UI's connectivity store (`ui/src/lib/connectivity.ts`)
 confirms an outage with a `/api/health` probe, then polls health with backoff
 (1s, 2s, 5s, 10s, then every 15s; a longer `Retry-After` wins). While the server

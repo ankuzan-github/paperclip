@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -149,8 +149,9 @@ WantedBy=default.target
 `;
 }
 
-export function renderLaunchdPlist(input: { instanceId: string; shimPath: string; homeDir: string; stdoutPath: string; stderrPath: string }): string {
+export function renderLaunchdPlist(input: { instanceId: string; shimPath: string; homeDir: string; stdoutPath: string; stderrPath: string; searchPath?: string }): string {
   const label = launchdServiceName(input.instanceId);
+  const searchPath = input.searchPath ?? [path.dirname(input.shimPath), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -162,6 +163,7 @@ export function renderLaunchdPlist(input: { instanceId: string; shimPath: string
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key><string>${escapeXml(searchPath)}</string>
     <key>PAPERCLIP_SERVICE_MANAGED</key><string>1</string>
     <key>PAPERCLIP_INSTANCE_ID</key><string>${escapeXml(input.instanceId)}</string>
     <key>PAPERCLIP_HOME</key><string>${escapeXml(input.homeDir)}</string>
@@ -281,6 +283,7 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly domain = `gui/${process.getuid?.() ?? 0}`;
   private readonly stdoutPath: string;
   private readonly stderrPath: string;
+  private readonly defaultSearchPath: string;
 
   constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
     this.serviceName = launchdServiceName(instanceId);
@@ -288,9 +291,23 @@ export class LaunchdServiceManager implements ServiceManager {
     const logDir = path.join(homeDir, "instances", instanceId, "logs");
     this.stdoutPath = path.join(logDir, "service.log");
     this.stderrPath = path.join(logDir, "service.err.log");
+    this.defaultSearchPath = [...new Set([path.join(userHomeDir, ".local", "bin"), path.dirname(shimPath),
+      "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
   }
 
-  renderDefinition(): string { return renderLaunchdPlist({ instanceId: this.instanceId, shimPath: this.shimPath, homeDir: this.homeDir, stdoutPath: this.stdoutPath, stderrPath: this.stderrPath }); }
+  renderDefinition(): string {
+    let searchPath = this.defaultSearchPath;
+    try {
+      const installed = readFileSync(this.definitionPath, "utf8");
+      const environment = installed.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)?.[1];
+      const savedPath = environment?.match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/)?.[1];
+      if (savedPath?.trim()) searchPath = unescapeXml(savedPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return renderLaunchdPlist({ instanceId: this.instanceId, shimPath: this.shimPath, homeDir: this.homeDir,
+      stdoutPath: this.stdoutPath, stderrPath: this.stderrPath, searchPath });
+  }
 
   async installedExecutablePath(): Promise<string | null> {
     try {
