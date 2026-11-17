@@ -532,7 +532,7 @@ type ActivityExecutionParticipant = Pick<
   "type" | "agentId" | "userId"
 >;
 type ExecutionStageWakeContext = {
-  wakeRole: "reviewer" | "approver" | "executor";
+  wakeRole: "reviewer" | "approver" | "deliverer" | "executor";
   stageId: string | null;
   stageType: ParsedExecutionState["currentStageType"];
   currentParticipant: ParsedExecutionState["currentParticipant"];
@@ -2843,14 +2843,22 @@ function buildExecutionStageWakeup(input: {
       );
     if (!agentId || !stageChanged) return null;
 
+    // A delivery participant is the executor shipping reviewed work, not a
+    // reviewer of it: the wake must say so or the prompt tells it not to act.
     const reason =
       nextState.currentStageType === "approval"
         ? "execution_approval_requested"
-        : "execution_review_requested";
+        : nextState.currentStageType === "delivery"
+          ? "execution_delivery_requested"
+          : "execution_review_requested";
     const executionStage = buildExecutionStageWakeContext({
       state: nextState,
       wakeRole:
-        nextState.currentStageType === "approval" ? "approver" : "reviewer",
+        nextState.currentStageType === "approval"
+          ? "approver"
+          : nextState.currentStageType === "delivery"
+            ? "deliverer"
+            : "reviewer",
       allowedActions: ["approve", "request_changes"],
     });
 

@@ -2997,6 +2997,27 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("wakes a delivery participant as deliverer, not as a reviewer told not to act", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "execution_delivery_requested",
+      issue: { id: "issue-1", identifier: "PAP-2012", title: "Ship it", status: "in_review" },
+      executionStage: {
+        wakeRole: "deliverer",
+        stageId: "stage-2",
+        stageType: "delivery",
+        currentParticipant: { type: "agent", agentId: "agent-2" },
+        returnAssignee: { type: "agent", agentId: "agent-2" },
+        allowedActions: ["approve", "request_changes"],
+      },
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("- execution wake role: deliverer");
+    expect(prompt).toContain("- execution stage: delivery");
+    expect(prompt).toContain("You are waking as the delivery participant for this issue");
+    expect(prompt).not.toContain("Do not execute the task itself");
+  });
+
   it("delivers typed disposition repair instructions without liveness classification", () => {
     const payload = { reason: "issue_disposition_repair", issue: { id: "issue-1", status: "in_progress" },
       dispositionRepair: { attempt: 1, maxAttempts: 2, sourceRunId: "source-1", instruction: "Record completion or a durable waiting path through the API." } };

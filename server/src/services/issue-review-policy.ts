@@ -2,6 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { IssueReviewPolicy } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export interface IssueReviewVerdictActor {
   type: "agent" | "user";
@@ -18,6 +19,20 @@ interface ReviewPolicyIssue {
   reviewPolicy?: IssueReviewPolicy | null;
   createdByAgentId?: string | null;
   createdByUserId?: string | null;
+  executionState?: unknown;
+}
+
+/**
+ * A pending delivery stage is held by the executor who moved the issue into
+ * review: approving it ships their own reviewed work and is not a verdict on
+ * it. `not_creator` would otherwise refuse every delivery with 403.
+ */
+function isOwnDeliveryStageApproval(issue: ReviewPolicyIssue, actor: IssueReviewVerdictActor): boolean {
+  const state = parseIssueExecutionState(issue.executionState);
+  if (state?.status !== "pending" || state.currentStageType !== "delivery") return false;
+  const participant = state.currentParticipant;
+  if (!participant || participant.type !== actor.type) return false;
+  return (participant.type === "agent" ? participant.agentId : participant.userId) === actor.id;
 }
 
 export async function resolveIssueReviewRequester(
@@ -120,6 +135,8 @@ export async function assertIssueReviewVerdictActorAllowed(
       },
     );
   }
+
+  if (isOwnDeliveryStageApproval(input.issue, input.actor)) return;
 
   const requester = await resolveIssueReviewRequester(db, input.issue);
   if (!requester) {

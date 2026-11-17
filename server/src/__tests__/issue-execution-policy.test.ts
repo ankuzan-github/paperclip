@@ -32,7 +32,11 @@ describe("stripMonitorFromExecutionPolicy", () => {
 });
 
 function makePolicy(
-  stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,
+  stages: Array<{
+    type: "review" | "approval" | "delivery";
+    participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }>;
+    approvalCommentPattern?: string;
+  }>,
 ) {
   return normalizeIssueExecutionPolicy({ stages })!;
 }
@@ -2319,6 +2323,218 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+    });
+  });
+});
+
+describe("delivery stage and approval comment pattern (LEA-1570 F1)", () => {
+  const reviewedSha = "a".repeat(40);
+  const reviewLine = `reviewed: ${reviewedSha}`;
+  const deliveryLine = `delivery: from=${"b".repeat(40)} to=${"c".repeat(40)} reviewed=${reviewedSha} not-required (docs)`;
+
+  // review(QA agent) → delivery(executor) → review(CTO agent): the shape of the
+  // product route, with the executor holding the middle stage.
+  function productRoutePolicy() {
+    return makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }], approvalCommentPattern: "^reviewed: [0-9a-f]{40}" },
+      { type: "delivery", participants: [{ type: "agent", agentId: coderAgentId }], approvalCommentPattern: "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}" },
+      { type: "review", participants: [{ type: "agent", agentId: ctoAgentId }] },
+    ]);
+  }
+
+  function pendingState(policy: IssueExecutionPolicy, index: number, participantAgentId: string, extra: Partial<IssueExecutionState> = {}) {
+    return {
+      status: "pending" as const,
+      currentStageId: policy.stages[index].id,
+      currentStageIndex: index,
+      currentStageType: policy.stages[index].type,
+      currentParticipant: { type: "agent" as const, agentId: participantAgentId },
+      returnAssignee: { type: "agent" as const, agentId: coderAgentId },
+      completedStageIds: policy.stages.slice(0, index).map((stage) => stage.id),
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      ...extra,
+    };
+  }
+
+  // Mirrors the PATCH route: apply the transition patch on top of the issue.
+  function applyPatch(issue: Record<string, unknown>, patch: Record<string, unknown>) {
+    return { ...issue, ...patch };
+  }
+
+  it("keeps approvalCommentPattern through normalization and accepts the delivery type", () => {
+    const policy = productRoutePolicy();
+    expect(policy.stages.map((stage) => stage.type)).toEqual(["review", "delivery", "review"]);
+    expect(policy.stages[0].approvalCommentPattern).toBe("^reviewed: [0-9a-f]{40}");
+    expect(policy.stages[2]).not.toHaveProperty("approvalCommentPattern");
+  });
+
+  it("rejects a pattern that does not compile or exceeds 200 characters", () => {
+    const stage = (approvalCommentPattern: string) => ({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }], approvalCommentPattern }],
+    });
+    expect(() => normalizeIssueExecutionPolicy(stage("^reviewed: ([0-9a-f]{40}"))).toThrow("Invalid execution policy");
+    expect(() => normalizeIssueExecutionPolicy(stage("x".repeat(201)))).toThrow("Invalid execution policy");
+    expect(normalizeIssueExecutionPolicy(stage("x".repeat(200)))!.stages[0].approvalCommentPattern).toHaveLength(200);
+  });
+
+  it("hands the delivery stage to the executor and lets the executor approve it", () => {
+    const policy = productRoutePolicy();
+    const afterReview = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_review", assigneeAgentId: qaAgentId, executionPolicy: policy, executionState: pendingState(policy, 0, qaAgentId) },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: reviewLine,
+    });
+    expect(afterReview.patch).toMatchObject({ status: "in_review", assigneeAgentId: coderAgentId });
+    expect(afterReview.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageType: "delivery",
+      currentStageIndex: 1,
+      currentParticipant: { type: "agent", agentId: coderAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+    });
+
+    const afterDelivery = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_review", assigneeAgentId: coderAgentId, executionPolicy: policy, executionState: afterReview.patch.executionState as IssueExecutionState },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: deliveryLine,
+    });
+    expect(afterDelivery.decision).toMatchObject({ stageType: "delivery", outcome: "approved" });
+    expect(afterDelivery.patch).toMatchObject({ status: "in_review", assigneeAgentId: ctoAgentId });
+    expect(afterDelivery.patch.executionState).toMatchObject({ currentStageIndex: 2, currentStageType: "review" });
+  });
+
+  it("still refuses to make the executor the participant of a review stage", () => {
+    const policy = makePolicy([{ type: "review", participants: [{ type: "agent", agentId: coderAgentId }] }]);
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, executionPolicy: policy, executionState: null },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Ready",
+      }),
+    ).toThrow("No eligible review participant");
+
+    const mixed = makePolicy([{ type: "review", participants: [{ type: "agent", agentId: coderAgentId }, { type: "agent", agentId: qaAgentId }] }]);
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, executionPolicy: mixed, executionState: null },
+      policy: mixed,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+      actor: { agentId: coderAgentId },
+      commentBody: "Ready",
+    });
+    expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+  });
+
+  it("rejects an approval without a comment line matching the stage pattern, naming the pattern", () => {
+    const policy = productRoutePolicy();
+    const approve = (commentBody: string) => applyIssueExecutionPolicyTransition({
+      issue: { status: "in_review", assigneeAgentId: qaAgentId, executionPolicy: policy, executionState: pendingState(policy, 0, qaAgentId) },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody,
+    });
+    let error: unknown;
+    try {
+      approve("LGTM, reviewed abc123");
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      status: 422,
+      message: expect.stringContaining("^reviewed: [0-9a-f]{40}"),
+      details: { code: "approval_comment_pattern_mismatch" },
+    });
+    expect(approve(`Looks good.\n${reviewLine}`).decision).toMatchObject({ outcome: "approved" });
+  });
+
+  it("does not apply the pattern to a changes-requested decision", () => {
+    const policy = productRoutePolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_review", assigneeAgentId: qaAgentId, executionPolicy: policy, executionState: pendingState(policy, 0, qaAgentId) },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Fix the migration",
+    });
+    expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+  });
+
+  it("resets changesRequestedCount when a stage is approved", () => {
+    const policy = productRoutePolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        executionPolicy: policy,
+        executionState: pendingState(policy, 0, qaAgentId, { changesRequestedCount: 2 }),
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: reviewLine,
+    });
+    expect(result.patch.executionState).toMatchObject({ currentStageType: "delivery", changesRequestedCount: 0 });
+  });
+
+  it("restarts at stage 0 only through a null-policy PATCH followed by a fresh policy with in_review", () => {
+    const policy = productRoutePolicy();
+    const returned = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      executionPolicy: policy,
+      executionState: {
+        ...pendingState(policy, 2, ctoAgentId),
+        status: "changes_requested" as const,
+        lastDecisionOutcome: "changes_requested" as const,
+        changesRequestedCount: 1,
+      },
+    };
+
+    // Resubmitting under the same policy resumes at the stage that returned it.
+    const resumed = applyIssueExecutionPolicyTransition({
+      issue: returned, policy, requestedStatus: "in_review", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Fixed",
+    });
+    expect(resumed.patch.executionState).toMatchObject({ currentStageIndex: 2 });
+
+    // A fresh policy in the same PATCH strands the issue in in_review with no state.
+    const fresh = productRoutePolicy();
+    const single = applyIssueExecutionPolicyTransition({
+      issue: returned, policy: fresh, previousPolicy: policy, requestedStatus: "in_review", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Fixed",
+    });
+    expect(single.patch).toEqual({ executionState: null });
+
+    // PATCH 1: executionPolicy null clears the state; status stays in_progress.
+    const cleared = applyIssueExecutionPolicyTransition({
+      issue: returned, policy: null, previousPolicy: policy, requestedAssigneePatch: {}, actor: { agentId: coderAgentId },
+    });
+    expect(cleared.patch).toEqual({ executionState: null });
+    const afterClear = applyPatch({ ...returned, executionPolicy: null }, cleared.patch);
+
+    // PATCH 2: fresh policy + in_review starts the chain at index 0.
+    const restarted = applyIssueExecutionPolicyTransition({
+      issue: afterClear as typeof returned, policy: fresh, previousPolicy: null, requestedStatus: "in_review", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Fixed",
+    });
+    expect(restarted.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+    expect(restarted.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: fresh.stages[0].id,
+      currentStageIndex: 0,
+      completedStageIds: [],
+      changesRequestedCount: 0,
     });
   });
 });

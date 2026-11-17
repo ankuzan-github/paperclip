@@ -540,7 +540,7 @@ type PaperclipWakeExecutionPrincipal = {
 };
 
 type PaperclipWakeExecutionStage = {
-  wakeRole: "reviewer" | "approver" | "executor" | null;
+  wakeRole: "reviewer" | "approver" | "deliverer" | "executor" | null;
   stageId: string | null;
   stageType: string | null;
   currentParticipant: PaperclipWakeExecutionPrincipal | null;
@@ -1594,6 +1594,7 @@ function normalizePaperclipWakeExecutionStage(
   const wakeRole =
     wakeRoleRaw === "reviewer" ||
     wakeRoleRaw === "approver" ||
+    wakeRoleRaw === "deliverer" ||
     wakeRoleRaw === "executor"
       ? wakeRoleRaw
       : null;
@@ -2987,6 +2988,14 @@ function renderPaperclipWakePromptBody(
         "A Paperclip Runner run cannot hand the task back itself; to request changes from one, report the required changes as a blocker with paperclip_block.",
         "A run completion report does not record the decision; record it before you report.",
         "If you request changes, the workflow routes back to the stored return assignee.",
+        "",
+      );
+    } else if (executionStage.wakeRole === "deliverer") {
+      lines.push(
+        "You are waking as the delivery participant for this issue: the reviewed change is yours to ship.",
+        "Deliver exactly the reviewed change, then approve this stage with PATCH /api/issues/{issueId} and {\"status\":\"done\",\"comment\":\"...\"}.",
+        "Approving does not close the issue when later stages remain; it hands the issue to the next stage.",
+        "Any other status counts as requesting changes and returns the issue to you; a code fix after review must go through review again.",
         "",
       );
     } else if (executionStage.wakeRole === "executor") {

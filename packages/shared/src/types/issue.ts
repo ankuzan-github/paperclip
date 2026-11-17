@@ -762,6 +762,8 @@ export interface IssueExecutionStage {
   type: IssueExecutionStageType;
   approvalsNeeded: 1;
   participants: IssueExecutionStageParticipant[];
+  /** Regex an approving comment must match; absent means any non-empty comment. */
+  approvalCommentPattern?: string | null;
 }
 
 export interface IssueExecutionMonitorPolicy {

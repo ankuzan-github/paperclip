@@ -275,7 +275,8 @@ async function installActor(
 async function normalizePolicy(input: {
   stages: Array<{
     id: string;
-    type: "review" | "approval";
+    type: "review" | "approval" | "delivery";
+    approvalCommentPattern?: string;
     participants: Array<
       { type: "agent"; agentId: string } | { type: "user"; userId: string }
     >;
@@ -3933,6 +3934,106 @@ describe("issue comment reopen routes", () => {
         }),
       ),
     );
+  });
+
+  describe("delivery stage (LEA-1570 F1)", () => {
+    const executorAgentId = "22222222-2222-4222-8222-222222222222";
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const deliveryLine = `delivery: from=${"b".repeat(40)} to=${"c".repeat(40)} reviewed=${"a".repeat(40)}`;
+
+    async function reviewThenDeliveryPolicy() {
+      return (await normalizePolicy({
+        stages: [
+          { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+          {
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            type: "delivery",
+            approvalCommentPattern: "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}",
+            participants: [{ type: "agent", agentId: executorAgentId }],
+          },
+        ],
+      }))!;
+    }
+
+    function stageState(policy: Awaited<ReturnType<typeof reviewThenDeliveryPolicy>>, index: number, participantAgentId: string) {
+      return {
+        status: "pending",
+        currentStageId: policy.stages[index].id,
+        currentStageIndex: index,
+        currentStageType: policy.stages[index].type,
+        currentParticipant: { type: "agent", agentId: participantAgentId },
+        returnAssignee: { type: "agent", agentId: executorAgentId },
+        completedStageIds: policy.stages.slice(0, index).map((stage) => stage.id),
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+    }
+
+    function serveIssue(issue: Record<string, unknown>) {
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch, updatedAt: new Date() }),
+      );
+    }
+
+    it("wakes the executor as deliverer, not reviewer, when review approval hands off to delivery", async () => {
+      const policy = await reviewThenDeliveryPolicy();
+      serveIssue({
+        ...makeIssue("in_review"),
+        assigneeAgentId: reviewerAgentId,
+        executionPolicy: policy,
+        executionState: stageState(policy, 0, reviewerAgentId),
+      });
+
+      const res = await request(
+        await installActor(createApp(), { type: "agent", agentId: reviewerAgentId, companyId: "company-1", runId: "run-2" }),
+      )
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "done", comment: "Reviewed, ship it" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.assigneeAgentId).toBe(executorAgentId);
+      expect(res.body.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "delivery",
+        currentParticipant: { type: "agent", agentId: executorAgentId },
+      });
+      await waitForWakeup(() =>
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          executorAgentId,
+          expect.objectContaining({
+            reason: "execution_delivery_requested",
+            payload: expect.objectContaining({
+              executionStage: expect.objectContaining({ wakeRole: "deliverer", stageType: "delivery" }),
+            }),
+          }),
+        ),
+      );
+    });
+
+    it("lets the executor approve its own delivery stage only with the evidence line", async () => {
+      const policy = await reviewThenDeliveryPolicy();
+      serveIssue({
+        ...makeIssue("in_review"),
+        assigneeAgentId: executorAgentId,
+        executionPolicy: policy,
+        executionState: stageState(policy, 1, executorAgentId),
+      });
+      const app = await installActor(createApp(), { type: "agent", agentId: executorAgentId, companyId: "company-1", runId: "run-3" });
+
+      const rejected = await request(app)
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "done", comment: "Deployed" });
+      expect(rejected.status).toBe(422);
+      expect(rejected.body.error).toContain("^delivery: from=[0-9a-f]{40}");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+
+      const approved = await request(app)
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "done", comment: `Shipped.\n${deliveryLine}` });
+      expect(approved.status).toBe(200);
+      expect(approved.body.executionState).toMatchObject({ status: "completed", lastDecisionOutcome: "approved" });
+    });
   });
 
   it("wakes the return assignee with execution_changes_requested", async () => {

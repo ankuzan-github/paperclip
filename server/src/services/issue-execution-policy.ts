@@ -376,6 +376,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
         type: stage.type,
         approvalsNeeded: 1 as const,
         participants: dedupedParticipants,
+        ...(stage.approvalCommentPattern ? { approvalCommentPattern: stage.approvalCommentPattern } : {}),
       };
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
@@ -486,7 +487,12 @@ function selectStageParticipant(
     exclude?: IssueExecutionStagePrincipal | null;
   },
 ): IssueExecutionStagePrincipal | null {
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
+  // Every caller excludes the return assignee so nobody reviews or approves
+  // their own work. A delivery stage is the executor shipping the reviewed
+  // change, so the executor is exactly who must hold it; this is the only
+  // place that rule is lifted.
+  const exclude = stage.type === "delivery" ? null : opts?.exclude ?? null;
+  const participants = stage.participants.filter((participant) => !principalsEqual(participant, exclude));
   if (participants.length === 0) return null;
   if (opts?.preferred) {
     const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));
@@ -494,6 +500,21 @@ function selectStageParticipant(
   }
   const first = participants[0];
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
+}
+
+/**
+ * Rejects a stage approval whose comment lacks the stage's required evidence
+ * line. The pattern checks the shape of the evidence, not its truth.
+ */
+function assertApprovalCommentMatchesStagePattern(stage: IssueExecutionStage, commentBody: string) {
+  const pattern = stage.approvalCommentPattern;
+  if (!pattern) return;
+  // Multiline so `^` anchors any line: the evidence line need not be first.
+  if (new RegExp(pattern, "m").test(commentBody)) return;
+  throw unprocessable(
+    `Approving this ${stage.type} stage requires a comment line matching ${pattern}. ${STAGE_DECISION_COMMENT_HINT}`,
+    { code: "approval_comment_pattern_mismatch", stageType: stage.type, approvalCommentPattern: pattern },
+  );
 }
 
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
@@ -804,6 +825,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }
+        assertApprovalCommentMatchesStagePattern(activeStage, input.commentBody);
         const approvedState = buildCompletedState(existingState, activeStage);
         // Only stages after the stage being approved are advance candidates.
         // Scanning the whole policy could wrap back to the first stage when

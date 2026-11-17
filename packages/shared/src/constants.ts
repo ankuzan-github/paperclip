@@ -545,8 +545,11 @@ export type ExternalObjectMentionConfidence = (typeof EXTERNAL_OBJECT_MENTION_CO
 export const ISSUE_EXECUTION_POLICY_MODES = ["normal", "auto"] as const;
 export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[number];
 
-export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
+// `delivery` is the executor's own stage (merge + deploy between review and
+// QA): its participant may be the return assignee, unlike review/approval.
+export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval", "delivery"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
+export const ISSUE_EXECUTION_STAGE_APPROVAL_COMMENT_PATTERN_MAX_LENGTH = 200;
 
 export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];

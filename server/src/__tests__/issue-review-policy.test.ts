@@ -126,6 +126,52 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
     })).resolves.toBeUndefined();
   });
 
+  it("lets the requester approve its own pending delivery stage under not_creator, and only that stage", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "agent",
+      actorId: seeded.requesterAgentId,
+      agentId: seeded.requesterAgentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+    });
+    const executor = { type: "agent" as const, agentId: seeded.requesterAgentId };
+    const stateFor = (currentStageType: "review" | "delivery", participantAgentId: string) => ({
+      status: "pending",
+      currentStageId: randomUUID(),
+      currentStageIndex: 1,
+      currentStageType,
+      currentParticipant: { type: "agent", agentId: participantAgentId },
+      returnAssignee: executor,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+
+    // The executor holds its own delivery stage: approving ships, it is not a verdict.
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: { ...seeded.issue, executionState: stateFor("delivery", seeded.requesterAgentId) },
+      actor: { type: "agent", id: seeded.requesterAgentId },
+    })).resolves.toBeUndefined();
+
+    // The same requester on a review stage, or on a delivery stage held by someone else, is still refused.
+    for (const executionState of [
+      stateFor("review", seeded.requesterAgentId),
+      stateFor("delivery", seeded.peerAgentId),
+    ]) {
+      await expect(assertIssueReviewVerdictActorAllowed(db, {
+        issue: { ...seeded.issue, executionState },
+        actor: { type: "agent", id: seeded.requesterAgentId },
+      })).rejects.toMatchObject<Partial<HttpError>>({
+        status: 403,
+        details: expect.objectContaining({ code: "review_policy_denied", policy: "not_creator" }),
+      });
+    }
+  });
+
   it("ignores later in-review snapshots that did not record a status transition", async () => {
     const seeded = await seedReview("not_creator");
     await db.insert(activityLog).values([

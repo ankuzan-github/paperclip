@@ -13,6 +13,7 @@ import {
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
   ISSUE_EXECUTION_POLICY_MODES,
   ISSUE_EXECUTION_STAGE_TYPES,
+  ISSUE_EXECUTION_STAGE_APPROVAL_COMMENT_PATTERN_MAX_LENGTH,
   ISSUE_EXECUTION_STATE_STATUSES,
   ISSUE_COMMENT_AUTHOR_TYPES,
   ISSUE_COMMENT_METADATA_ROW_TYPES,
@@ -424,6 +425,22 @@ export const issueExecutionStageSchema = z.object({
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  // A regex the approving comment must match. It must compile here: a broken
+  // pattern stored on a stage would turn every later approval into a 500.
+  approvalCommentPattern: z
+    .string()
+    .min(1)
+    .max(ISSUE_EXECUTION_STAGE_APPROVAL_COMMENT_PATTERN_MAX_LENGTH)
+    .refine((pattern) => {
+      try {
+        new RegExp(pattern);
+        return true;
+      } catch {
+        return false;
+      }
+    }, { message: "approvalCommentPattern must be a valid regular expression" })
+    .optional()
+    .nullable(),
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
