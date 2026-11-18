@@ -69,6 +69,7 @@ export function createHeartbeatQueueTestDependencies(db: Db): QueueTestDependenc
     resumeExecutionWaitComments: vi.fn<HeartbeatQueueDependencies["resumeExecutionWaitComments"]>(async () => undefined),
     resumeQueuedCommentInterrupt: vi.fn<HeartbeatQueueDependencies["resumeQueuedCommentInterrupt"]>(async () => undefined),
     resumeSavedLegacyComments: vi.fn<HeartbeatQueueDependencies["resumeSavedLegacyComments"]>(async () => undefined),
+    resumeStoppedUserComments: vi.fn<HeartbeatQueueDependencies["resumeStoppedUserComments"]>(async () => undefined),
     formatIssueIdentifierLink: (_identifier: string | null, fallback: string) => fallback,
     sweepPendingCleanupLeases: vi.fn<HeartbeatQueueDependencies["sweepPendingCleanupLeases"]>(),
   } satisfies HeartbeatQueueDependencies;
