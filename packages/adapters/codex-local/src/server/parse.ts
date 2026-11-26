@@ -183,6 +183,11 @@ export function classifyCodexAuthRefreshFailure(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): CodexAuthRefreshFailureClass | null {
+  // A usage-limit verdict on the turn means the backend authenticated the
+  // request; auth noise elsewhere (the background model-list refresh logs a
+  // 401 to stderr) is stale and must not park the run behind a reconnect card.
+  if (input.errorMessage && CODEX_PROVIDER_QUOTA_RE.test(input.errorMessage)) return null;
+
   const haystack = buildCodexErrorHaystack(input);
 
   if (CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)) return "refresh_token_reused";

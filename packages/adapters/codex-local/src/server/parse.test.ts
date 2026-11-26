@@ -196,6 +196,21 @@ describe("classifyCodexAuthRefreshFailure", () => {
       stdout: JSON.stringify({ type: "item.completed", item: { type: "error", message: "OAuth failed: invalid_grant" } }),
     })).toBe("refresh_token_invalidated");
   });
+
+  // 2026-11-26: seven runs parked behind a reconnect card for 5 h. The turn
+  // failed on the usage limit, but Codex's background model-list refresh had
+  // logged a 401 to stderr, and the contextual auth heuristic won over quota.
+  it("keeps the quota verdict when the turn failed on the usage limit and stderr has a stale 401", () => {
+    const errorMessage = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 3:07 PM.";
+    const stderr = "2026-11-26T09:37:17.783792Z ERROR codex_models_manager::manager: failed to refresh available models: unexpected status 401 Unauthorized: Provided authentication token is expired., url: https://chatgpt.com/backend-api/codex/models?client_version=0.171.0";
+
+    expect(classifyCodexAuthRefreshFailure({ stderr, errorMessage })).toBeNull();
+    expect(isCodexProviderQuotaError({ stderr, errorMessage })).toBe(true);
+    // Without a quota verdict the same stderr still reads as an auth failure.
+    expect(classifyCodexAuthRefreshFailure({ stderr, errorMessage: "Codex exited with code 1" })).toBe(
+      "refresh_token_invalidated",
+    );
+  });
 });
 
 describe("isCodexUnknownSessionError", () => {
