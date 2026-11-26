@@ -2606,6 +2606,32 @@ function pendingFinalizeBlockerCondition(companyId: string, issueId: SQL, worksp
             and owning_finalize.finished_at >= latest_blocker_operation.finished_at
         )
       )
+      -- Fork (Cards): nothing can finalize a local workspace whose run already
+      -- ended without success (process lost on a service restart, failed
+      -- finalize) while no run of the blocker is queued or live. Holding dependents on it waits forever
+      -- (LEA-1890, LEA-1895 held LEA-1861); a remote workspace keeps the barrier
+      -- for its copyback.
+      and not (
+        latest_blocker_operation.heartbeat_run_id is not null
+        and latest_blocker_operation.phase not like 'remote\\_%'
+        and exists (
+          select 1 from heartbeat_runs ended_run
+          where ended_run.id = latest_blocker_operation.heartbeat_run_id
+            and ended_run.status in ('interrupted', 'failed', 'cancelled', 'timed_out')
+        )
+        and exists (
+          select 1 from execution_workspaces local_workspace
+          where local_workspace.id = ${workspaceId}
+            and local_workspace.metadata -> 'remoteWorkspace' is null
+        )
+        and not exists (
+          select 1 from heartbeat_runs live_run
+          where live_run.company_id = ${companyId}::uuid
+            and live_run.status in ('queued', 'running', 'scheduled_retry')
+            and (live_run.context_snapshot ->> 'issueId' = (${issueId})::text
+              or live_run.native_issue_id = ${issueId})
+        )
+      )
   )`;
 }
 
@@ -9564,6 +9590,20 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       return listIssueDependencyReadinessMap(dbOrTx, companyId, issueIds);
+    },
+
+    /** The same blockers `update` refuses an `in_progress` move on: the requested
+     * list when the request replaces it, otherwise the issue's current readiness. */
+    listUnresolvedBlockerIdsForProgress: async (
+      issue: { id: string; companyId: string },
+      requestedBlockerIssueIds: string[] | null,
+      dbOrTx: any = db,
+    ): Promise<string[]> => {
+      if (requestedBlockerIssueIds) {
+        return listUnresolvedBlockerIssueIds(dbOrTx, issue.companyId, requestedBlockerIssueIds);
+      }
+      const readiness = await listIssueDependencyReadinessMap(dbOrTx, issue.companyId, [issue.id]);
+      return readiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [];
     },
 
     listBlockerAttentionBatch: async (companyId: string, issueRows: IssueBlockerAttentionInputNode[], dbOrTx: any = db) =>

@@ -688,6 +688,46 @@ const attachmentArtifactMetadataInputSchema = z
   })
   .passthrough();
 
+const OWNERLESS_STALL_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked"]);
+
+/**
+ * Fork (Cards): agents only run issues assigned to them, so an issue an agent
+ * files without an owner never starts. Review remarks filed that way stalled
+ * whole stages (LEA-1661…1668 sat in todo; LEA-1889…1897 held LEA-1861 from a
+ * backlog). Refuse at the door, whatever client builds the request; deliberate
+ * deferral stays possible as an ordinary backlog issue that blocks nothing.
+ */
+function assertAgentFiledIssueHasOwner(
+  req: Request,
+  body: {
+    status?: unknown;
+    assigneeAgentId?: unknown;
+    assigneeUserId?: unknown;
+    blockParentUntilDone?: unknown;
+  },
+) {
+  if (req.actor.type !== "agent") return;
+  const owned =
+    (typeof body.assigneeAgentId === "string" && body.assigneeAgentId.length > 0) ||
+    (typeof body.assigneeUserId === "string" && body.assigneeUserId.length > 0);
+  const status = typeof body.status === "string" ? body.status : null;
+  if (body.blockParentUntilDone === true && (!owned || status === "backlog")) {
+    throw unprocessable(
+      "A blocker of its parent must have an owner and be ready to run: set assigneeAgentId " +
+        "(or assigneeUserId) and status todo. An unassigned or backlog blocker never starts " +
+        "and holds the parent until someone notices.",
+      { code: "blocker_without_owner", status, owned },
+    );
+  }
+  if (!owned && status && OWNERLESS_STALL_STATUSES.has(status)) {
+    throw unprocessable(
+      `An issue in ${status} without an assignee never starts: set assigneeAgentId (or ` +
+        "assigneeUserId). To defer it on purpose, create it in backlog.",
+      { code: "issue_without_owner", status },
+    );
+  }
+}
+
 function buildCreateIssueActivityStatusDetails(
   issue: { assigneeAgentId: string | null; assigneeUserId: string | null; status: string },
   res: Response,
@@ -7939,9 +7979,22 @@ export function issueRoutes(
       input.assigneeAgentId,
     );
     if (!ancestor) return;
+    // Fork (Cards): a stage participant filing a remark for the author of the
+    // work under its review is returning that work, not delegating back. The
+    // refusal told reviewers to leave remarks unassigned, and nobody ever ran
+    // them (LEA-1661, LEA-1802, LEA-1873).
+    const parent = await svc.getById(input.parentIssueId);
+    const stage = parseObject(parent?.executionState);
+    const participant = parseObject(stage.currentParticipant);
+    const returnAssignee = parseObject(stage.returnAssignee);
+    if (
+      stage.status === "pending" &&
+      participant.agentId === input.actorAgentId &&
+      returnAssignee.agentId === input.assigneeAgentId
+    ) return;
     throw conflict(
       `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to. ` +
-        "Complete the remaining work in your own issue, leave the child unassigned, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
+        "Complete the remaining work in your own issue or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
       {
         code: "delegation_cycle",
         ancestorIssueId: ancestor.id,
@@ -13126,6 +13179,10 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId ?? conversationAgentId ?? undefined,
           { actorType: req.actor.type },
         );
+      assertAgentFiledIssueHasOwner(req, {
+        ...rawCreateBody,
+        assigneeAgentId: normalizedAssigneeAgentId,
+      });
       // A delegated follow-up from an ordinary execution task keeps that task as
       // its structural parent when the agent omits `parentId`. An explicit
       // `parentId: null` is an intentional standalone task and is honored.
@@ -13680,6 +13737,7 @@ export function issueRoutes(
           ? { assigneeAgentId: normalizedAssigneeAgentId }
           : {}),
       };
+      assertAgentFiledIssueHasOwner(req, createBody);
       // Board users nest freely, and watchdog follow-ups are located by parent.
       // Other agents build at most parent → child trees: a child of a child is
       // placed beside it instead (never rejected).
@@ -14799,6 +14857,31 @@ export function issueRoutes(
       const existingRelations = Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
         : null;
+      // Fork (Cards): an agent may not make this issue wait on an open blocker
+      // that nobody owns — no agent is ever woken on it (LEA-1907 held LEA-1903).
+      if (req.actor.type === "agent" && existingRelations) {
+        const linked = new Set(existingRelations.blockedBy.map((relation) => relation.id));
+        const added = [...new Set(req.body.blockedByIssueIds as string[])].filter((id) => !linked.has(id));
+        const ownerless = added.length === 0 ? [] : await db
+          .select({ id: issueRows.id, identifier: issueRows.identifier })
+          .from(issueRows)
+          .where(
+            and(
+              eq(issueRows.companyId, existing.companyId),
+              inArray(issueRows.id, added),
+              notInArray(issueRows.status, ["done", "cancelled"]),
+              isNull(issueRows.assigneeAgentId),
+              isNull(issueRows.assigneeUserId),
+            ),
+          );
+        if (ownerless.length > 0) {
+          throw unprocessable(
+            "New blockers must have an owner, or nothing will ever close them: assign " +
+              `${ownerless.map((row) => row.identifier ?? row.id).join(", ")} first.`,
+            { code: "blocker_without_owner", issueIds: ownerless.map((row) => row.id) },
+          );
+        }
+      }
       const {
         comment: commentBody,
         commentClientRequestId,
@@ -15287,6 +15370,22 @@ export function issueRoutes(
         throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
       }
       Object.assign(updateFields, transition.patch);
+      const requestedBlockerIdsForProgress = Array.isArray(req.body.blockedByIssueIds)
+        ? [...new Set(req.body.blockedByIssueIds as string[])]
+        : null;
+      // Fork (Cards): a stage participant's changes-requested decision files its
+      // remarks as first-class blockers. The workflow moves the issue to
+      // `in_progress`, which `update` refuses while blockers are unresolved, so
+      // the decision could never land (LEA-1861, LEA-1883). Hand the issue back
+      // as `blocked` on those remarks: the return assignee owns it, and the
+      // dependency wake brings them back when the last remark closes.
+      if (
+        transition.decision?.outcome === "changes_requested" &&
+        updateFields.status === "in_progress" &&
+        (await svc.listUnresolvedBlockerIdsForProgress(existing, requestedBlockerIdsForProgress)).length > 0
+      ) {
+        updateFields.status = "blocked";
+      }
       let deferredNativeStageApproval = false;
       if (nativeStageApproval === "defer_final_status") {
         // Only the final stage's approval is deferred. Anything else this
@@ -15514,6 +15613,26 @@ export function issueRoutes(
               : plannedParentId) as string | null | undefined,
             assigneeAgentId: nextAssigneeAgentId,
             assigneeUserId: nextAssigneeUserId,
+          });
+        }
+      }
+
+      // Fork (Cards): the reassignment below stops the current run before
+      // `update` validates the move. When the caller is that run, a refusal
+      // after the stop kills it silently and the hand-off never happens
+      // (LEA-1861: the reviewer died on its own return). Refuse first.
+      if (
+        assigneeWillChange &&
+        existing.assigneeAgentId &&
+        updateFields.status === "in_progress"
+      ) {
+        const unresolvedBlockerIssueIds = await svc.listUnresolvedBlockerIdsForProgress(
+          existing,
+          requestedBlockerIdsForProgress,
+        );
+        if (unresolvedBlockerIssueIds.length > 0) {
+          throw unprocessable("Issue is blocked by unresolved blockers", {
+            unresolvedBlockerIssueIds,
           });
         }
       }

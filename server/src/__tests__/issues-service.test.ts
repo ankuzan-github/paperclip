@@ -4679,6 +4679,73 @@ const dependencyTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ISSU
     });
   });
 
+  it("releases dependents when the blocker's run ended before finalizing a local workspace", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+    const lostRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: lostRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      contextSnapshot: { issueId: blockerId },
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      heartbeatRunId: lostRunId,
+      phase: "workspace_provision",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+
+    // While the run lives it may still finalize: the barrier holds.
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+
+    // The process is lost on a service restart after the blocker went done.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "process_lost" })
+      .where(eq(heartbeatRuns.id, lostRunId));
+    const retryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "queued",
+      contextSnapshot: { issueId: blockerId },
+    });
+    // A queued retry of the blocker can still finalize: keep waiting for it.
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+
+    await db.update(heartbeatRuns).set({ status: "cancelled" })
+      .where(eq(heartbeatRuns.id, retryRunId));
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+
+    // A remote workspace keeps the barrier for its copyback.
+    await db.update(executionWorkspaces)
+      .set({ metadata: { remoteWorkspace: { kind: "sandbox" } } })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+  });
+
   it("gates dependents on the blocker's own workspace-finalize barrier until sync-back succeeds", async () => {
     const {
       companyId,
