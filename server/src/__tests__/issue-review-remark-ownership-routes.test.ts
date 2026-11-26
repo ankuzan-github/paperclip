@@ -299,15 +299,22 @@ describeEmbeddedPostgres("review remark ownership routes", () => {
     });
     const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
     await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
-    const ownerlessId = await seedIssue(seeded.companyId, "RLB-102", { status: "backlog" });
+    const ownerlessId = await seedIssue(seeded.companyId, "RLB-102", {
+      status: "backlog",
+      createdByAgentId: seeded.implementerAgentId,
+    });
+    const reviewer = app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId));
 
-    const res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)))
-      .patch(`/api/issues/${issueId}`)
-      .send({ blockedByIssueIds: [ownerlessId] });
+    const res = await request(reviewer).patch(`/api/issues/${issueId}`).send({ blockedByIssueIds: [ownerlessId] });
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.details).toMatchObject({ code: "blocker_without_owner", issueIds: [ownerlessId] });
     const relations = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, issueId));
     expect(relations).toEqual([]);
+
+    // A board-filed umbrella without an owner is a legitimate thing to wait on.
+    const umbrellaId = await seedIssue(seeded.companyId, "RLB-103", { status: "todo" });
+    const waiting = await request(reviewer).patch(`/api/issues/${issueId}`).send({ blockedByIssueIds: [umbrellaId] });
+    expect(waiting.status, JSON.stringify(waiting.body)).toBe(200);
   });
 });

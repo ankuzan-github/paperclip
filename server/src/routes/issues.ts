@@ -76,7 +76,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -14857,8 +14857,10 @@ export function issueRoutes(
       const existingRelations = Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
         : null;
-      // Fork (Cards): an agent may not make this issue wait on an open blocker
-      // that nobody owns — no agent is ever woken on it (LEA-1907 held LEA-1903).
+      // Fork (Cards): an agent may not make this issue wait on an open blocker an
+      // agent filed without an owner — no agent is ever woken on it (LEA-1907
+      // held LEA-1903). Board-filed umbrellas and [human] tasks stay linkable:
+      // waiting on them is a legitimate dependency (LEA-1440 on LEA-1086).
       if (req.actor.type === "agent" && existingRelations) {
         const linked = new Set(existingRelations.blockedBy.map((relation) => relation.id));
         const added = [...new Set(req.body.blockedByIssueIds as string[])].filter((id) => !linked.has(id));
@@ -14872,6 +14874,7 @@ export function issueRoutes(
               notInArray(issueRows.status, ["done", "cancelled"]),
               isNull(issueRows.assigneeAgentId),
               isNull(issueRows.assigneeUserId),
+              isNotNull(issueRows.createdByAgentId),
             ),
           );
         if (ownerless.length > 0) {
