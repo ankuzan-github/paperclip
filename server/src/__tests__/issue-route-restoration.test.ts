@@ -358,22 +358,80 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     expect((await f.preview().expect(409)).body.details.code).toBe("route_restore_invalid_source");
   });
 
-  it("refuses unavailable QA and retires an intent superseded by a policy-only edit", async () => {
+  it("refuses unavailable QA and retires a deferred intent superseded by a policy-only edit", async () => {
     const f = await seed();
     await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, f.qa));
     expect((await f.preview().expect(409)).body.details.code).toBe("route_restore_participant_unavailable");
     await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, f.qa));
     const { body: { expectedVersion } } = await f.preview().expect(200);
     const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const heartbeat = heartbeatService(db);
+    const dispatch = { companyId: f.companyId, requestId: applied.wakeupRequestId };
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxDailyRuns: 0 } } }).where(eq(agents.id, f.qa));
+    await heartbeat.dispatchPendingNativeStatusWakeups(dispatch);
+    expect(await wakes(f.issueId)).toEqual([expect.objectContaining({ id: dispatch.requestId, status: "queued" })]);
 
     const policy = structuredClone(f.policy);
     policy.stages[3].approvalCommentPattern = "^new-design-verdict:";
     await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issueId));
-    const heartbeat = heartbeatService(db);
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId, requestId: applied.wakeupRequestId });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } }).where(eq(agents.id, f.qa));
+    await heartbeat.dispatchPendingNativeStatusWakeups(dispatch);
     expect((await wakes(f.issueId)).find(wake => wake.id === applied.wakeupRequestId)?.status).toBe("skipped");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).toHaveLength(0);
   });
+
+  it.each(["maxDailyRuns", "maxDailyCostCents", "dependency"] as const)("retries the same QA wake after temporary %s refusal", async gate => {
+    const f = await seed();
+    const { body: { expectedVersion } } = await f.preview().expect(200);
+    const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const setGate = async (blocked: boolean) => {
+      if (gate === "dependency") {
+        await app(f.board).patch(`/api/issues/${f.issueId}`).send({
+          blockedByIssueIds: blocked ? [f.resolvedIssueId, f.blockerIssueId] : [f.resolvedIssueId],
+        }).expect(200);
+      } else {
+        await db.update(agents).set({ runtimeConfig: {
+          heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1, [gate]: blocked ? 0 : 5 },
+        } }).where(eq(agents.id, f.qa));
+      }
+    };
+    const readRuns = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId));
+    const dispatch = { companyId: f.companyId, requestId: applied.wakeupRequestId };
+    const heartbeat = heartbeatService(db);
+    const scheduleRetry = vi.fn();
+
+    await setGate(true);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ ...dispatch, onDeferredDeadline: scheduleRetry }))
+      .toEqual({ scanned: 1, dispatched: 0, recovered: 0, deferred: 1 });
+    expect(await readRuns()).toHaveLength(0);
+    expect(invokeAdapter).not.toHaveBeenCalled();
+    expect(await wakes(f.issueId)).toEqual([expect.objectContaining({ id: dispatch.requestId, status: "queued",
+      runId: null, claimedAt: null, finishedAt: null })]);
+    expect(scheduleRetry).toHaveBeenCalledOnce();
+    expect(scheduleRetry.mock.calls[0][0]).toBeGreaterThan(Date.now());
+    expect(await readIssue(f.issueId)).toMatchObject({ status: "in_review", assigneeAgentId: f.qa });
+
+    await setGate(false);
+    const restarted = heartbeatService(db);
+    try {
+      await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups(dispatch),
+        restarted.dispatchPendingNativeStatusWakeups(dispatch)]);
+      await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
+    } finally {
+      await Promise.all([heartbeat.drainActiveRunExecutions(), restarted.drainActiveRunExecutions()]);
+    }
+    expect((await f.apply(expectedVersion).expect(200)).body).toEqual(applied);
+    expect(await restarted.dispatchPendingNativeStatusWakeups(dispatch)).toEqual({ scanned: 0, dispatched: 0, recovered: 0, deferred: 0 });
+    expect(invokeAdapter).toHaveBeenCalledOnce();
+    const runs = await readRuns();
+    expect(runs).toEqual([expect.objectContaining({ agentId: f.qa, wakeupRequestId: applied.auditActivityId })]);
+    expect(await wakes(f.issueId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: dispatch.requestId, status: "coalesced", runId: runs[0].id }),
+      expect.objectContaining({ id: applied.auditActivityId, runId: runs[0].id }),
+    ]));
+    expect(await wakes(f.issueId)).toHaveLength(2);
+    expect(await audits(f.issueId)).toHaveLength(1);
+  }, 30_000);
 
   it("returns one durable receipt for simultaneous applies", async () => {
     const f = await seed();

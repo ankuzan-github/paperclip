@@ -4087,6 +4087,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             !blockedInteractionWake
           ) {
             if (caseRequest) waitForCaseAdmission("issue_dependencies_blocked", "Case handoff is waiting for task dependencies to resolve");
+            // A restoration intent owns the retry. A skipped receipt with
+            // its fixed delivery ID would prevent another admission attempt.
+            if (restoreWakeReceipt) return { kind: "deferred" as const };
             await recordExecutionWait(tx as unknown as Db, {
               issueId: issue.id,
               coalesce: coalesceExecutionWait,
@@ -4530,6 +4533,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           );
           if (dailyCapBlock) {
             if (caseRequest) waitForCaseAdmission(dailyCapBlock.reason, "Case handoff is waiting for the agent's daily limit to clear");
+            if (restoreWakeReceipt) return { kind: "deferred" as const };
             if (executionWaitRequestId && executionBlocker) {
               continuationWait = { reason: dailyCapBlock.reason,
                 message: "The agent has reached its daily limit. Your message is saved until work can resume." };
@@ -5328,12 +5332,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           .limit(1)
           .then((rows) => rows[0] ?? null);
 
-        // The committer intent is the durable outbox entry. When admission is
-        // blocked, enqueueWakeup creates a separate deferred dispatch receipt;
-        // leave the original intent coalesced so the release drain cannot
-        // promote both rows (the original has no nativeStatusWakeIntentId
-        // provenance and would otherwise run once before the dispatch receipt).
+        // The committer intent is the durable outbox entry. If admission saves
+        // a separate deferred dispatch receipt, leave the intent coalesced so
+        // the release drain cannot promote both rows (the original has no
+        // nativeStatusWakeIntentId provenance and would run before the receipt).
         const deliveredStatus = delivered?.status ?? "queued";
+        const waitingForRestoredRouteAdmission = isRouteRestoration && !delivered && !wakeRun;
         await db.transaction(async tx => {
           await notifyChatRunMilestones(tx, { companyId: candidate.companyId, issueId: issueId ?? undefined });
           await tx
@@ -5347,7 +5351,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 wakeRun || delivered?.finishedAt
                   ? (delivered?.finishedAt ?? new Date())
                   : null,
-              error: delivered?.error ?? (isRouteRestoration && !wakeRun ? "Waiting for normal QA admission" : null),
+              ...(waitingForRestoredRouteAdmission ? { claimedAt: null } : {}),
+              error: delivered?.error ?? (waitingForRestoredRouteAdmission ? "Waiting for normal QA admission" : null),
               updatedAt: new Date(),
             })
             .where(and(eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.claimedAt, now)));
@@ -5362,7 +5367,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
         if (wakeRun) dispatched += 1;
         else {
-          if (isRouteRestoration && !delivered) input.onDeferredDeadline?.(Date.now() + 30_000);
+          if (waitingForRestoredRouteAdmission) input.onDeferredDeadline?.(Date.now() + 30_000);
           deferred += 1;
         }
       } catch (error) {
