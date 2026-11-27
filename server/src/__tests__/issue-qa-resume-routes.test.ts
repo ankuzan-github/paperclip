@@ -17,12 +17,15 @@ import {
   issueRelations,
   issues,
   issueThreadInteractions,
+  projects,
 } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { getServerAdapter, registerServerAdapter } from "../adapters/index.js";
+import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { terminateLocalService } from "../services/local-service-supervisor.js";
 import { startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
 import type { StorageService } from "../storage/types.js";
 import {
@@ -38,6 +41,7 @@ vi.mock("../services/heartbeat.js", async (importOriginal) => {
     wakeup,
   }) };
 });
+vi.mock("../services/local-service-supervisor.js", { spy: true });
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -84,7 +88,7 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     await temporary?.cleanup();
   });
 
-  async function fixture(options: { historical?: boolean; identifier?: string; stagePattern?: string } = {}) {
+  async function fixture(options: { historical?: boolean; identifier?: string; stagePattern?: string; projectId?: string } = {}) {
     const historical = options.historical ?? false;
     const identifier = options.identifier ?? (historical ? "LEA-1880" : `LEA-${++issueNumber}`);
     const issueId = randomUUID();
@@ -124,7 +128,7 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     };
     await db.insert(issues).values({
       id: issueId, companyId, identifier, title: identifier, assigneeAgentId: implementer,
-      status: "in_progress", statusVersion: 12, executionPolicy, executionState,
+      status: "in_progress", statusVersion: 12, executionPolicy, executionState, projectId: options.projectId,
     });
     await db.insert(heartbeatRuns).values({
       id: runId, companyId, agentId: implementer, issueId, status: "running",
@@ -160,13 +164,12 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       stageId, returnDecisionId, ceoInteractionId, statusVersion: issue!.statusVersion,
       updatedAt: issue!.updatedAt.toISOString(), comment: "QA resumes with the reviewed and delivered package.",
     };
-    const history = () => db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))
-      .orderBy(issueExecutionDecisions.id);
-    const snapshot = async () => ({
-      issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
-      decisions: await history(),
-      comments: await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
-      audit: await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)),
+    const snapshot = async (reader = db) => ({
+      issue: (await reader.select().from(issues).where(eq(issues.id, issueId)))[0],
+      decisions: await reader.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))
+        .orderBy(issueExecutionDecisions.id),
+      comments: await reader.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+      audit: await reader.select().from(activityLog).where(eq(activityLog.entityId, issueId)),
     });
     const authorization = (ownerRun: string = runId) => `Bearer ${createLocalAgentJwt(implementer, companyId, "process", ownerRun)}`;
     const path = `/api/issues/${identifier}/resume-execution-stage`;
@@ -324,6 +327,71 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     await expectRejection(f, 409, f.body, "issue_qa_resume_run_not_owner");
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, checkoutRunId));
     await f.resume().expect(200);
+  });
+
+  it("revokes QA write authority when budget Stop commits while the provider is still stopping", async () => {
+    const [project] = await db.insert(projects).values({ companyId, name: "Budget Stop fixture" }).returning();
+    const f = await fixture({ projectId: project!.id });
+    const lockDb = createDb(temporary.connectionString, { maxConnections: 2 });
+    const releaseIssue = Promise.withResolvers<void>();
+    const issueLocked = Promise.withResolvers<number>();
+    const acknowledgeStop = Promise.withResolvers<void>();
+    const stopProvider = vi.mocked(terminateLocalService).mockImplementationOnce(() => acknowledgeStop.promise);
+    runningProcesses.set(f.runId, { child: { pid: 425031 } as never, graceSec: 4, processGroupId: 425031 });
+    const holdIssue = lockDb.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      issueLocked.resolve(backend!.pid);
+      await releaseIssue.promise;
+    });
+    void holdIssue.catch(issueLocked.reject);
+
+    let response: PromiseLike<request.Response> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      const holder = await issueLocked.promise;
+      // Let the real JWT middleware authorize the PATCH before committing Stop.
+      response = f.resume().then((result) => result);
+      await vi.waitFor(async () => {
+        const [observed] = await lockDb.execute<{ waiting: boolean }>(sql`
+          select exists (select 1 from pg_stat_activity
+            where datname = current_database() and ${holder} = any(pg_blocking_pids(pid))) as waiting
+        `);
+        expect(observed?.waiting).toBe(true);
+      }, { timeout: 5_000 });
+
+      const scope = { companyId, scopeType: "project" as const, scopeId: project!.id };
+      stopping = heartbeatService(lockDb).cancelBudgetScopeWork(scope);
+      void stopping.catch(() => undefined);
+      await vi.waitFor(() => expect(stopProvider).toHaveBeenCalledOnce(), { timeout: 5_000 });
+      const [run] = await lockDb.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run).toMatchObject({ status: "running", resultJson: { startupCancellation: { budgetEnforcement: scope } } });
+
+      const snapshot = async () => ({
+        ...await f.snapshot(lockDb),
+        wakeups: await lockDb.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+        qaRuns: await lockDb.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, qa)),
+      });
+      const before = await snapshot();
+      releaseIssue.resolve();
+      const denied = await response;
+      expect(denied.status).toBe(403);
+      expect(denied.body.details?.code).toBe("agent_run_cancelled");
+      const later = await f.resume().expect(403);
+      expect(later.body.code).toBe("agent_run_cancelled");
+      expect(await snapshot()).toEqual(before);
+      expect(wakeup).not.toHaveBeenCalled();
+    } finally {
+      releaseIssue.resolve();
+      acknowledgeStop.resolve();
+      try {
+        await Promise.all([holdIssue, response, stopping]);
+      } finally {
+        runningProcesses.delete(f.runId);
+        stopProvider.mockRestore();
+        await lockDb.$client.end();
+      }
+    }
   });
 
   it.each(["version", "updatedAt"] as const)("refuses a changed %s under the original client snapshot", async (kind) => {

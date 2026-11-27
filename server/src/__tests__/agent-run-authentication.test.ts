@@ -57,7 +57,11 @@ const support = await getEmbeddedPostgresTestSupport();
       '{"executionCancellation":{"state":"requested"}}',
       '{"executionCancellation":{"state":"completed"}}',
       '{"executionCancellation":{"state":true}}',
-      '{"executionCancellation":{"state":["requested"]}}'];
+      '{"executionCancellation":{"state":["requested"]}}',
+      '{"startupCancellation":null}', '{"startupCancellation":{}}',
+      '{"startupCancellation":{"budgetEnforcement":null}}',
+      '{"startupCancellation":{"budgetEnforcement":[]}}',
+      '{"startupCancellation":{"budgetEnforcement":{"scopeType":"agent"}}}'];
     const contexts = [null, "null", '"true"', "[]", "{}", '{"conversationMode":true}',
       '{"conversationMode":false}', '{"conversationMode":"true"}', '{"conversationMode":1}'];
     for (const status of ["running", "cancelled"]) {
@@ -78,7 +82,9 @@ const support = await getEmbeddedPostgresTestSupport();
       contextSnapshot: { prompt: payload, conversationMode: true } }).where(eq(heartbeatRuns.id, runId));
     const [row] = await loadAgentRunAuthentication(db, input);
     expect(contract(row)).toEqual(contract(await baseline()));
-    expect(row.resultJson).toEqual({ executionCancellation: { state: null } });
+    expect(row.resultJson).toEqual({
+      executionCancellation: { state: null }, startupCancellation: { budgetEnforcement: null },
+    });
     expect(row.contextSnapshot).toEqual({ conversationMode: true });
     expect(Buffer.byteLength(JSON.stringify(row))).toBeLessThan(512);
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } })

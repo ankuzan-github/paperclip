@@ -13,6 +13,9 @@ export function loadAgentRunAuthentication(db: Db, input: {
     resultJson: sql<Record<string, unknown>>`jsonb_build_object(
       'executionCancellation', jsonb_build_object(
         'state', ${heartbeatRuns.resultJson}->'executionCancellation'->'state'
+      ),
+      'startupCancellation', jsonb_build_object(
+        'budgetEnforcement', ${heartbeatRuns.resultJson}->'startupCancellation'->'budgetEnforcement'
       )
     )`,
     contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(

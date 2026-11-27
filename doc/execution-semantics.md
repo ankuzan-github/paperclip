@@ -100,7 +100,9 @@ transaction checks the saved QA stage and return, task snapshot, dependency
 readiness, and the CEO's answered interaction on that task. The answer starts
 with `pc-resume-qa: LEA-<n> return=<decision-id>`. The LEA-1880 decision predates
 this format and is accepted by its specific return and interaction IDs.
-A stale snapshot produces HTTP 409.
+A stale snapshot produces HTTP 409. A committed budget Stop revokes write
+authority immediately, so a PATCH from that run receives HTTP 403 even while
+the provider is still stopping. The transition rechecks this under a run lock.
 
 The response is the issue in `in_review` with its saved QA stage pending and
 its QA participant assigned. The policy and decision history are preserved.
