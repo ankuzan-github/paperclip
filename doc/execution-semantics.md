@@ -114,6 +114,31 @@ stage and return are still pending. Later comments queue behind the saved
 stage wake until it can run with its original context. The Cards client
 verifies the reviewed and delivered Git package before calling this endpoint.
 
+### Resubmitting a Cards review after a CEO decision
+
+`PATCH /api/issues/:id/resubmit-execution-review` accepts `stageId`,
+`returnDecisionId`, `ceoInteractionId`, `reviewedSha`, `statusVersion`,
+`updatedAt`, and `comment`. The current Fullstack run must hold its Cards
+task, the latest execution decision must be the saved return, and at least
+three returns must be recorded. The transaction verifies the task snapshot,
+run authority, and blocker readiness while holding their rows. The Cards
+client verifies the task branch and published Git SHA.
+
+The CEO must answer `next_route` on the same task with
+`pc-resubmit-review: LEA-<n> return=<decision-id> sha=<reviewed-sha>`.
+The historical LEA-2049 answer is bound to its exact task, return,
+interaction, idempotency key, SHA, and saved authorizing paragraph.
+Replaying a used interaction or submitting a stale snapshot returns HTTP
+409. The first comment line is `submitted: <sha> branch=pc/<issue>`.
+
+Success returns the issue in `in_review` with the Architect assigned to the
+first stage. The new review, delivery, and QA stages receive new IDs and
+start with no approvals. Historical decisions remain accessible. The
+interaction consumption receipt, submission comment, standard issue
+activity, and deferred Architect wake commit with the issue. Queue
+promotion matches the saved return and the new review stage after release
+or restart.
+
 ## 3. Status Semantics
 
 Paperclip issue statuses are not just UI labels. They imply different expectations about ownership and execution.

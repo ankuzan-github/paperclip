@@ -24,6 +24,12 @@ import { listIssueStatusBlockerAttention } from "../services/issue-status-presen
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { issueQaResumeSnapshotChanged, prepareIssueQaResume, type ResumeIssueExecutionStage } from "../services/issue-qa-resume.js";
+import {
+  ISSUE_REVIEW_RESUBMISSION_CONSUMED,
+  issueReviewResubmissionSnapshotChanged,
+  prepareIssueReviewResubmission,
+  type ResubmitIssueExecutionReview,
+} from "../services/issue-review-resubmission.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { markIssueReadSchema } from "@paperclipai/shared";
@@ -158,6 +164,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
   resumeIssueExecutionStageSchema,
+  resubmitIssueExecutionReviewSchema,
   updateIssueSchema,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
@@ -14753,12 +14760,10 @@ export function issueRoutes(
     return lock;
   }
 
-  router.patch(
-    "/issues/:id/resume-execution-stage",
-    validateIssueMutationBody(resumeIssueExecutionStageSchema),
-    async (req, res) => {
+  function transitionReturnedReviewStage(operation: "resume" | "resubmit") {
+    return async (req: Request, res: Response) => {
       if (req.actor.type !== "agent" || req.actor.source !== "agent_jwt" || !req.actor.agentId || !req.actor.runId) {
-        throw forbidden("Resuming QA requires an authenticated task run");
+        throw forbidden("This review transition requires an authenticated task run");
       }
       const actor = { agentId: req.actor.agentId, runId: req.actor.runId };
       const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
@@ -14770,29 +14775,37 @@ export function issueRoutes(
       }
 
       const request: ResumeIssueExecutionStage = req.body;
+      const resubmission = operation === "resubmit" ? req.body as ResubmitIssueExecutionReview : null;
+      const snapshotChanged = resubmission ? issueReviewResubmissionSnapshotChanged : issueQaResumeSnapshotChanged;
       const publications: ActivityPublication[] = [];
       const issue = await db.transaction(async (tx) => {
         const locked = await svc.getByIdForUpdate(existing.id, tx);
         if (!locked || locked.companyId !== existing.companyId) throw notFound("Issue not found");
-        const patch = await prepareIssueQaResume(tx, locked, request, actor);
+        const patch = resubmission
+          ? await prepareIssueReviewResubmission(tx, locked, resubmission, actor)
+          : await prepareIssueQaResume(tx, locked, request, actor);
 
         // Hold the blocker sources through the commit. A busy source must be
         // re-read instead of proceeding on a status that may be rolled back.
         const readiness = await svc.getDependencyReadiness(locked.id, tx, { lockSources: true }).catch((error: unknown) => {
           if (parseObject(error).code === "55P03" || parseObject(parseObject(error).cause).code === "55P03") {
-            throw issueQaResumeSnapshotChanged();
+            throw snapshotChanged();
           }
           throw error;
         });
         if (!readiness.isDependencyReady) {
           throw conflict("Issue is blocked by unresolved blockers", {
-            code: "issue_qa_resume_unresolved_blockers",
+            code: resubmission ? "issue_review_resubmission_unresolved_blockers" : "issue_qa_resume_unresolved_blockers",
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
           });
         }
 
         const responsibleUserId = authenticatedActorResponsibleUserId(req);
         const authorizationReason = issueWriteAuthorizationReason(req, accessDecision);
+        if (resubmission) {
+          await assertAgentInteraction(tx, { companyId: locked.companyId, actorAgentId: actor.agentId,
+            operation: "comment", issueId: locked.id, texts: [request.comment] });
+        }
         const comment = await svc.addComment(locked.id, request.comment, {
           ...actor,
           onBehalfOfUserId: responsibleUserId,
@@ -14804,22 +14817,25 @@ export function issueRoutes(
           actorAgentId: actor.agentId,
           actorRunId: actor.runId,
         }, tx, publications);
-        if (!updated) throw issueQaResumeSnapshotChanged();
+        if (!updated) throw snapshotChanged();
+        const nextState = parseIssueExecutionState(updated.executionState);
         const wake = buildExecutionStageWakeup({
           issueId: locked.id,
           previousState: parseIssueExecutionState(locked.executionState),
-          nextState: parseIssueExecutionState(updated.executionState),
+          nextState,
           interruptedRunId: null,
           requestedByActorType: "agent",
           requestedByActorId: actor.agentId,
         });
-        if (!wake) throw issueQaResumeSnapshotChanged();
+        if (!wake) throw snapshotChanged();
 
         // The outgoing run still owns execution. Commit the successor's wake
         // with the stage so release or restart can promote the same receipt.
         const requestId = randomUUID();
         await notifyDeferredExecutionWork(tx, { companyId: locked.companyId, requestId });
         const { payload, contextSnapshot, ...wakeup } = wake.wakeup;
+        // The saved wake remains bound to its stage and return after restart.
+        // Retain the original payload key for readers of persisted QA wakes.
         await tx.insert(agentWakeupRequests).values({
           ...wakeup,
           id: requestId,
@@ -14841,17 +14857,42 @@ export function issueRoutes(
           entityType: "issue",
           entityId: locked.id,
         };
+        const evidence = {
+          stageId: request.stageId,
+          returnDecisionId: request.returnDecisionId,
+          ceoInteractionId: request.ceoInteractionId,
+          commentId: comment.id,
+        };
+        const reviewResubmission = resubmission && {
+          ...evidence,
+          reviewedSha: resubmission.reviewedSha,
+          reviewStageId: nextState?.currentStageId,
+        };
+        if (reviewResubmission) {
+          await logActivity(tx as unknown as Db, {
+            companyId: locked.companyId,
+            actorType: "system",
+            actorId: "cards-review-resubmission",
+            responsibleUserIdOverride: responsibleUserId,
+            entityType: "issue",
+            entityId: locked.id,
+            action: ISSUE_REVIEW_RESUBMISSION_CONSUMED,
+            details: { ...reviewResubmission, submittedByAgentId: actor.agentId, submittedByRunId: actor.runId },
+          }, publications);
+        }
         await logActivity(tx as unknown as Db, {
           ...activity,
           action: "issue.updated",
           details: {
             identifier: locked.identifier,
             changes: updated.changes,
-            stageId: request.stageId,
-            returnDecisionId: request.returnDecisionId,
-            ceoInteractionId: request.ceoInteractionId,
-            commentId: comment.id,
-            source: "resume_execution_stage",
+            ...evidence,
+            ...(reviewResubmission ? {
+              source: "comment",
+              executionPolicy: updated.executionPolicy,
+              executionState: updated.executionState,
+              reviewResubmission,
+            } : { source: "resume_execution_stage" }),
           },
         }, publications);
         await logActivity(tx as unknown as Db, {
@@ -14863,13 +14904,25 @@ export function issueRoutes(
             identifier: locked.identifier,
             issueTitle: locked.title,
             authorizationReason,
+            ...(reviewResubmission ? { updated: true } : {}),
           },
         }, publications);
         return updated;
       });
       for (const publication of publications) publishActivity(publication);
       res.json(issue);
-    },
+    };
+  }
+
+  router.patch(
+    "/issues/:id/resume-execution-stage",
+    validateIssueMutationBody(resumeIssueExecutionStageSchema),
+    transitionReturnedReviewStage("resume"),
+  );
+  router.patch(
+    "/issues/:id/resubmit-execution-review",
+    validateIssueMutationBody(resubmitIssueExecutionReviewSchema),
+    transitionReturnedReviewStage("resubmit"),
   );
 
   router.patch(

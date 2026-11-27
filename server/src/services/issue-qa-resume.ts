@@ -1,11 +1,10 @@
 import { and, eq } from "drizzle-orm";
-import { heartbeatRuns, issueExecutionDecisions, issueThreadInteractions, type Db, type issues } from "@paperclipai/db";
+import { issueExecutionDecisions, issueThreadInteractions, type Db, type issues } from "@paperclipai/db";
 import { askUserQuestionsResultSchema, issueExecutionPolicySchema, resumeIssueExecutionStageSchema } from "@paperclipai/shared";
 import type { z } from "zod";
-import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { conflict, forbidden } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import { assertIssueReturnRunOwner } from "./issue-return-run.js";
 
 export type ResumeIssueExecutionStage = z.infer<typeof resumeIssueExecutionStageSchema>;
 
@@ -38,22 +37,7 @@ export async function prepareIssueQaResume(
   }
 
   const runNotOwner = () => conflict("Only the running task owner can resume QA", { code: "issue_qa_resume_run_not_owner" });
-  if ((issue.executionRunId ?? issue.checkoutRunId) !== actor.runId) {
-    throw runNotOwner();
-  }
-  // Queue admission can bind the new execution before replacing an ended checkout.
-  if (issue.checkoutRunId && issue.checkoutRunId !== actor.runId) {
-    const [checkout] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, issue.checkoutRunId)).for("share");
-    if (checkout && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkout.status)) throw runNotOwner();
-  }
-  const run = await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
-  // Coalesced wakes can replace the context. Use the admitted task binding
-  // when one exists and fall back to the context for older legacy runs.
-  const runIssueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
-  if (run?.status !== "running" || runIssueId !== issue.id) {
-    throw runNotOwner();
-  }
+  await assertIssueReturnRunOwner(tx, issue, actor, runNotOwner);
 
   const state = parseIssueExecutionState(issue.executionState);
   const policy = issueExecutionPolicySchema.safeParse(issue.executionPolicy);

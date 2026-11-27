@@ -1028,6 +1028,12 @@ export const resumeIssueExecutionStageSchema = z.strictObject({
   comment: multilineTextSchema.pipe(z.string().trim().min(1)),
 });
 
+export const resubmitIssueExecutionReviewSchema = resumeIssueExecutionStageSchema.extend({
+  ceoInteractionId: resumeIssueExecutionStageSchema.shape.ceoInteractionId.transform((id) => id.toLowerCase()),
+  reviewedSha: z.string().regex(/^[0-9a-f]{40}$/),
+  comment: resumeIssueExecutionStageSchema.shape.comment.transform((body) => body.replaceAll("\r\n", "\n")),
+});
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     workspaceSelection: true,

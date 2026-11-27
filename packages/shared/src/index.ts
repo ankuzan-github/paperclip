@@ -1993,6 +1993,7 @@ export {
   issueBlockedInboxStateSchema,
   updateIssueSchema,
   resumeIssueExecutionStageSchema,
+  resubmitIssueExecutionReviewSchema,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   requiredQualityReviewSchema,
