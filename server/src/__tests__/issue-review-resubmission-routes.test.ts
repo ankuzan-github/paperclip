@@ -88,7 +88,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     const identifier = historical ? "LEA-2049" : `LEA-${++issueNumber}`;
     const issueId = historical ? "fcc11975-dfac-4d12-8b49-6f90182b3462" : randomUUID();
     const returnDecisionId = historical ? "af456ebd-4a00-4a1c-9eb3-2499ca84c79c" : randomUUID();
-    const ceoInteractionId = historical ? "15bc20b1-b677-494d-ab4a-e4dff86f53fb" : randomUUID();
+    const ceoInteractionId: string = historical ? "15bc20b1-b677-494d-ab4a-e4dff86f53fb" : randomUUID();
     const runId = randomUUID();
     const stageId = randomUUID();
     const executionPolicy = {
@@ -178,7 +178,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
       if (code) expect(response.body.details?.code ?? response.body.code).toBe(code);
       expect(await snapshot()).toEqual(before);
     };
-    return { issueId, identifier, runId, marker, body, path, authorization, call, snapshot, setAnswer, rejectWithoutWrites };
+    return { issueId, identifier, runId, marker, body, path, authorization, call, snapshot, setAnswer, rejectWithoutWrites, executionPolicy };
   }
 
   it("serializes two submissions and persists the route, evidence, comment, audit and one wake", async () => {
@@ -195,7 +195,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
       .toEqual([["review", reviewer, pattern.review], ["delivery", implementer, pattern.delivery], ["review", qa, pattern.qa]]);
     expect(new Set(stages.map((stage: typeof stages[number]) => stage.id)).size).toBe(3);
     for (const stage of stages) {
-      expect(before.issue?.executionPolicy?.stages.some((previous) => previous.id === stage.id)).toBe(false);
+      expect(f.executionPolicy.stages.some((previous) => previous.id === stage.id)).toBe(false);
     }
     expect(updated).toMatchObject({
       status: "in_review", assigneeAgentId: reviewer, assigneeUserId: null, statusVersion: f.body.statusVersion + 1,
