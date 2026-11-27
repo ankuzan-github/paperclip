@@ -1,4 +1,4 @@
-import { ISSUE_ROUTE_RESTORED, ISSUE_ROUTE_RESTORATION_WAKE, isRestoredRouteCurrent } from "../issue-route-restoration-wake.js";
+import { ISSUE_ROUTE_RESTORED, ISSUE_ROUTE_RESTORATION_WAKE, readRestoredRouteWakeContext } from "../issue-route-restoration-wake.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -3454,12 +3454,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
               eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             )).limit(1).then(rows => rows[0] ?? null);
-          const restoredRouteChanged = restoreWakeReceipt && !(await isRestoredRouteCurrent(tx as unknown as Db, {
-            companyId: issue.companyId, issueId: issue.id, restorationActivityId: restoreWakeReceipt.id,
-          }));
+          const restoredExecutionStage = restoreWakeReceipt
+            ? await readRestoredRouteWakeContext(tx as unknown as Db, {
+                companyId: issue.companyId, issueId: issue.id, restorationActivityId: restoreWakeReceipt.id,
+              })
+            : null;
           if (
             issueStateGuard &&
-            (restoredRouteChanged || !issueStateGuard.statuses.includes(issue.status) ||
+            ((restoreWakeReceipt && !restoredExecutionStage) || !issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
               (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
               (issueStateGuard.monitorNextCheckAt !== undefined && (
@@ -3498,6 +3500,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
+          }
+
+          if (restoredExecutionStage) {
+            enrichedContextSnapshot.executionStage = restoredExecutionStage;
           }
 
           if (opts.failedRunId) {

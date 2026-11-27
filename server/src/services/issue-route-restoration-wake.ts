@@ -1,5 +1,6 @@
 import { activityLog, issues, type Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
+import { buildExecutionStageWakeContext, parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export const ISSUE_ROUTE_RESTORED = "issue.execution_policy_restored";
 export const ISSUE_ROUTE_RESTORATION_WAKE = "issue_execution_policy_restored";
@@ -10,11 +11,11 @@ export const issueRouteFingerprint = sql<string>`encode(sha256(convert_to(
 )), 'hex')`;
 
 /** Admission calls this while it owns the issue row. Policy-only edits may
- * leave statusVersion unchanged, so the wake must still match the audited route. */
-export async function isRestoredRouteCurrent(db: Db, input: {
+ * leave statusVersion unchanged, so build context only from the audited route. */
+export async function readRestoredRouteWakeContext(db: Db, input: {
   companyId: string; issueId: string; restorationActivityId: string;
 }) {
-  const [match] = await db.select({ id: activityLog.id }).from(activityLog)
+  const [match] = await db.select({ executionState: issues.executionState }).from(activityLog)
     .innerJoin(issues, and(eq(issues.companyId, activityLog.companyId),
       sql`${issues.id}::text = ${activityLog.entityId}`))
     .where(and(eq(activityLog.companyId, input.companyId), eq(issues.id, input.issueId),
@@ -22,5 +23,6 @@ export async function isRestoredRouteCurrent(db: Db, input: {
       eq(activityLog.action, ISSUE_ROUTE_RESTORED),
       sql`${issueRouteFingerprint} = ${activityLog.details}->>'routeFingerprint'`,
     )).limit(1);
-  return Boolean(match);
+  const state = parseIssueExecutionState(match?.executionState);
+  return state?.status === "pending" ? buildExecutionStageWakeContext(state) : null;
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
   activityLog, agents, agentWakeupRequests, authUsers, companies, companyMemberships,
   createDb, executionWorkspaces, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issueRelations,
@@ -69,7 +70,11 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
       memberships: [{ companyId, status: "active", membershipRole: role }] };
   }
 
-  async function seed(name: Incident = "LEA-1901", useOriginalIds = false) {
+  async function seed(
+    name: Incident = "LEA-1901",
+    useOriginalIds = false,
+    reviewRequest: { instructions: string } | null = null,
+  ) {
     const incident = incidents[name];
     const companyId = randomUUID();
     const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 8).toUpperCase()}`;
@@ -89,12 +94,14 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     original.assigneeAgentId = fullstack;
     original._previous.executionState.currentParticipant.agentId = qa;
     original._previous.executionState.returnAssignee.agentId = fullstack;
+    const previousState = { ...original._previous.executionState, reviewRequest };
     const snapshot = {
       ...original,
+      _previous: { ...original._previous, executionState: previousState },
       changes: {
         ...original.changes,
         executionPolicy: { from: structuredClone(policy), to: original.executionPolicy },
-        executionState: { from: structuredClone(original._previous.executionState), to: original.executionState },
+        executionState: { from: structuredClone(previousState), to: original.executionState },
       },
     };
 
@@ -161,10 +168,13 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
       eq(activityLog.action, "issue.execution_policy_restored")));
   }
 
-  it.each(["LEA-1901", "LEA-1928"] as const)(
-    "restores %s from its stage IDs and decisions through the queue, then moves from QA to Designer",
-    async name => {
-      const f = await seed(name, true);
+  it.each([
+    { name: "LEA-1901", reviewRequest: null },
+    { name: "LEA-1928", reviewRequest: { instructions: "Verify the restored route before approving." } },
+  ] as const)(
+    "restores $name from its stage IDs and decisions through the queue, then moves from QA to Designer",
+    async ({ name, reviewRequest }) => {
+      const f = await seed(name, true, reviewRequest);
       const before = await readIssue(f.issueId);
       const preview = await f.preview().expect(200);
       expect(preview.body).toMatchObject({ dryRun: true, status: "in_review",
@@ -221,9 +231,31 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
           heartbeatService(db).dispatchPendingNativeStatusWakeups(dispatch)]);
         await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
         const qaRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId));
-        expect(qaRuns).toEqual([expect.objectContaining({ agentId: f.qa, status: "running",
-          contextSnapshot: expect.objectContaining({ restorationActivityId: audit.id }) })]);
-        qaRunId = qaRuns[0].id;
+        const executionStage = {
+          wakeRole: "reviewer",
+          stageId: f.policy.stages[2].id,
+          stageType: "review",
+          currentParticipant: { type: "agent", agentId: f.qa, userId: null },
+          returnAssignee: { type: "agent", agentId: f.fullstack, userId: null },
+          reviewRequest,
+          lastDecisionOutcome: "approved",
+          allowedActions: ["approve", "request_changes"],
+        };
+        expect(qaRuns).toHaveLength(1);
+        const [qaRun] = qaRuns;
+        expect(qaRun.agentId).toBe(f.qa);
+        expect(qaRun.status).toBe("running");
+        expect(qaRun.contextSnapshot?.wakeReason).toBe("issue_execution_policy_restored");
+        expect(qaRun.contextSnapshot?.restorationActivityId).toBe(audit.id);
+        expect(qaRun.contextSnapshot?.executionStage).toEqual(executionStage);
+        qaRunId = qaRun.id;
+        const [adapterInput] = invokeAdapter.mock.calls[0];
+        expect(adapterInput.runId).toBe(qaRunId);
+        expect(adapterInput.context.paperclipWake).toMatchObject({ executionStage });
+        const prompt = renderPaperclipWakePrompt(adapterInput.context.paperclipWake);
+        expect(prompt).toContain("You are waking as the active reviewer for this issue.");
+        expect(prompt).toContain("allowed actions: approve, request_changes");
+        if (reviewRequest) expect(prompt).toContain(reviewRequest.instructions);
         expect(await readIssue(f.issueId)).toMatchObject({ executionRunId: qaRunId, status: "in_review" });
         const agent: Express.Request["actor"] = {
           type: "agent", source: "agent_jwt", companyId: f.companyId, agentId: f.qa, runId: qaRunId,

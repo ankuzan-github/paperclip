@@ -420,6 +420,27 @@ export function parseIssueExecutionState(input: unknown): IssueExecutionState | 
   return parsed.data;
 }
 
+export function buildExecutionStageWakeContext(state: IssueExecutionState) {
+  if (state.status !== "pending" && state.status !== "changes_requested") return null;
+
+  const changesRequested = state.status === "changes_requested";
+  // Delivery executes reviewed work, so its participant needs delivery instructions.
+  const wakeRole = changesRequested ? "executor"
+    : state.currentStageType === "delivery" ? "deliverer"
+    : state.currentStageType === "approval" ? "approver"
+    : "reviewer";
+  return {
+    wakeRole,
+    stageId: state.currentStageId,
+    stageType: state.currentStageType,
+    currentParticipant: state.currentParticipant,
+    returnAssignee: state.returnAssignee,
+    reviewRequest: state.reviewRequest ?? null,
+    lastDecisionOutcome: state.lastDecisionOutcome,
+    allowedActions: changesRequested ? ["address_changes", "resubmit"] : ["approve", "request_changes"],
+  };
+}
+
 export function assigneePrincipal(input: AssigneeLike): IssueExecutionStagePrincipal | null {
   if (input.assigneeAgentId) {
     return { type: "agent", agentId: input.assigneeAgentId, userId: null };
