@@ -57,6 +57,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, heldConversationComments, isConversation } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
+import { restoreIssueRoute } from "../services/issue-route-restoration.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -109,6 +110,7 @@ import {
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  issueRouteRestorationRequestSchema,
   acceptIssueThreadInteractionSchema,
   resolveConfirmationFromCommentSchema,
   attachmentArtifactWorkProductMetadataSchema,
@@ -5201,8 +5203,9 @@ export function issueRoutes(
       status: string;
     },
     action: "issue:comment" | "issue:read" | "issue:mutate",
+    issueAccess = access,
   ) {
-    return access.decide({
+    return issueAccess.decide({
       actor: req.actor,
       action,
       resource: {
@@ -10269,6 +10272,28 @@ export function issueRoutes(
       actions: [...(active ? [active] : []), ...retainedHolds
         .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
     });
+  });
+
+  router.post("/issues/:id/execution-policy/restore-from-activity", validate(issueRouteRestorationRequestSchema), async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+
+    const result = await restoreIssueRoute({
+      db,
+      issueId: issue.id,
+      companyId: issue.companyId,
+      operatorId: getActorInfo(req).actorId,
+      request: req.body,
+      authorize: async (tx, lockedIssue) => {
+        const issueAccess = accessService(tx);
+        if (!(await decideIssueAccess(req, lockedIssue, "issue:read", issueAccess)).allowed)
+          throw notFound("Issue not found");
+        const decision = await decideIssueAccess(req, lockedIssue, "issue:mutate", issueAccess);
+        if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      },
+    });
+    res.json(result);
   });
 
   router.post("/issues/:id/retry", validate(taskRetrySchema), async (req, res) => {

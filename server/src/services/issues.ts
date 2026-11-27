@@ -362,7 +362,7 @@ export async function executeIssuePostCommitActions(
   }
 }
 
-function wakeRequestTargetsIssue(issueId: string) {
+export function wakeRequestTargetsIssue(issueId: string) {
   return sql`(
     ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
     or ${agentWakeupRequests.payload} ->> 'taskId' = ${issueId}

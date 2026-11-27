@@ -1,3 +1,4 @@
+import { ISSUE_ROUTE_RESTORED, ISSUE_ROUTE_RESTORATION_WAKE, isRestoredRouteCurrent } from "../issue-route-restoration-wake.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -2366,7 +2367,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, savedInteractionOrigin?: unknown) {
+  async function enqueueWakeup(
+    agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string,
+    savedInteractionOrigin?: unknown, restoreWakeReceipt?: { id: string; requestedAt: Date },
+  ) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -2590,7 +2594,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         opts.idempotencyKey !== museRequest.idempotencyKey)) {
       throw conflict("Muse work request does not match its admission authority.");
     }
-    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt;
+    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt ?? restoreWakeReceipt;
     const durableReceiptFields = receiptRequest
       ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
@@ -2602,6 +2606,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .where(eq(agentWakeupRequests.id, receiptRequest.id))
         .limit(1)
         .then((rows) => rows[0] ?? null);
+      if (receipt && restoreWakeReceipt && (receipt.companyId !== agent.companyId || receipt.agentId !== agentId ||
+          receipt.payload?.issueId !== issueId || receipt.idempotencyKey !== opts.idempotencyKey)) {
+        throw conflict("Route restoration wake receipt identity changed");
+      }
       if (receipt && durableRequest) assertDurableChatWakeupReceipt(durableRequest, receipt);
       if (receipt && caseRequest && (receipt.companyId !== agent.companyId || receipt.agentId !== agentId ||
           receipt.payload?.issueId !== caseRequest.issueId || receipt.idempotencyKey !== `case-handoff:${caseRequest.handoffId}`))
@@ -2672,9 +2680,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
     ): Promise<{ created: boolean; waitSaved?: boolean }> => {
-      // A temporary refusal must leave the handoff retryable, without burning
-      // its one durable receipt ID on a skipped wake.
-      if (caseRequest) return { created: false };
+      // Handoff and restoration outboxes retain temporary refusals so a skip
+      // cannot consume the one durable dispatch receipt.
+      if (caseRequest || restoreWakeReceipt) return { created: false };
       if (executionWaitRequestId) {
         const waitSaved = await writeDeferredExecutionWait(db, { companyId: agent.companyId, requestId: executionWaitRequestId }, {
           reason: skipReason, message: patch.error ?? (skipReason === "issue_tree_hold_active"
@@ -3446,9 +3454,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
               eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             )).limit(1).then(rows => rows[0] ?? null);
+          const restoredRouteChanged = restoreWakeReceipt && !(await isRestoredRouteCurrent(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, restorationActivityId: restoreWakeReceipt.id,
+          }));
           if (
             issueStateGuard &&
-            (!issueStateGuard.statuses.includes(issue.status) ||
+            (restoredRouteChanged || !issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
               (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
               (issueStateGuard.monitorNextCheckAt !== undefined && (
@@ -5180,14 +5191,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             eq(agentWakeupRequests.id, candidate.id),
             isNull(agentWakeupRequests.runId),
             candidate.status === "claimed"
-              ? eq(agentWakeupRequests.status, "claimed")
+              ? and(eq(agentWakeupRequests.status, "claimed"), candidate.claimedAt
+                ? eq(agentWakeupRequests.claimedAt, candidate.claimedAt)
+                : isNull(agentWakeupRequests.claimedAt))
               : eq(agentWakeupRequests.status, "queued"),
           ),
         )
         .returning({ id: agentWakeupRequests.id });
       if (claimed.length === 0) continue;
 
-      const scopeKey = issueId
+      const isRouteRestoration = candidate.reason === ISSUE_ROUTE_RESTORATION_WAKE;
+      const scopeKey = issueId && !isRouteRestoration
         ? `${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
         : null;
       const priorDelivery = scopeKey
@@ -5205,7 +5219,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               error: null,
               updatedAt: new Date(),
             })
-            .where(eq(agentWakeupRequests.id, candidate.id));
+            .where(and(eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.claimedAt, now)));
         });
         recovered += 1;
         continue;
@@ -5241,6 +5255,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (onboardingResultReport) completedOnboardingGuard = { assigneeAgentId: candidate.agentId, statuses: ["done"], statusVersion: targetIssue!.statusVersion };
         if (
           !targetIssue ||
+          (isRouteRestoration && (targetIssue.status !== "in_review" ||
+            targetIssue.statusVersion !== payload.restoredStatusVersion)) ||
           (["done", "cancelled"].includes(targetIssue.status) && !onboardingResultReport) ||
           (targetIssue.assigneeAgentId !== candidate.agentId && !nativeReview) ||
           (candidate.reason === "native_completion_review" && !nativeReview)
@@ -5254,12 +5270,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 finishedAt: new Date(),
                 error: !targetIssue
                   ? "Native status wake target no longer exists"
-                  : ["done", "cancelled"].includes(targetIssue.status)
-                    ? `Native status wake target is already ${targetIssue.status}`
-                    : "Native status wake target has a different assignee",
+                  : isRouteRestoration
+                    ? "Restored route is no longer current"
+                    : ["done", "cancelled"].includes(targetIssue.status)
+                      ? `Native status wake target is already ${targetIssue.status}`
+                      : "Native status wake target has a different assignee",
                 updatedAt: new Date(),
               })
-              .where(eq(agentWakeupRequests.id, candidate.id));
+              .where(and(eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.claimedAt, now)));
           });
           recovered += 1;
           continue;
@@ -5277,16 +5295,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           idempotencyKey: candidate.idempotencyKey,
           requestedByActorType: "system",
           requestedByActorId: dispatchActorId,
-          ...(completedOnboardingGuard ? { issueStateGuard: completedOnboardingGuard } : {}),
+          ...(isRouteRestoration ? {
+            issueStateGuard: { assigneeAgentId: candidate.agentId, statuses: ["in_review"],
+              statusVersion: Number(payload.restoredStatusVersion) },
+          } : completedOnboardingGuard ? { issueStateGuard: completedOnboardingGuard } : {}),
           contextSnapshot: {
             ...wakeContext,
             ...(issueId ? { issueId, taskId: issueId } : {}),
             wakeReason: candidate.reason,
-            source: "native_status_decision",
-            statusDecisionSource: "native_status_decision",
+            source: isRouteRestoration ? ISSUE_ROUTE_RESTORED : "native_status_decision",
+            ...(isRouteRestoration
+              ? { restorationActivityId: payload.restorationActivityId }
+              : { statusDecisionSource: "native_status_decision" }),
             nativeStatusWakeIntentId: candidate.id,
           },
-        }, undefined, candidate.payload?.interactionOrigin);
+        }, undefined, candidate.payload?.interactionOrigin,
+        // Two dispatchers recovering a stale claim share one receipt primary
+        // key, even if both reach admission before either links the intent.
+        isRouteRestoration ? { id: String(payload.restorationActivityId), requestedAt: candidate.requestedAt } : undefined);
 
         const delivered = await db
           .select()
@@ -5321,10 +5347,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 wakeRun || delivered?.finishedAt
                   ? (delivered?.finishedAt ?? new Date())
                   : null,
-              error: delivered?.error ?? null,
+              error: delivered?.error ?? (isRouteRestoration && !wakeRun ? "Waiting for normal QA admission" : null),
               updatedAt: new Date(),
             })
-            .where(eq(agentWakeupRequests.id, candidate.id));
+            .where(and(eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.claimedAt, now)));
         });
 
         if (scopeKey) {
@@ -5335,7 +5361,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
 
         if (wakeRun) dispatched += 1;
-        else deferred += 1;
+        else {
+          if (isRouteRestoration && !delivered) input.onDeferredDeadline?.(Date.now() + 30_000);
+          deferred += 1;
+        }
       } catch (error) {
         input.onError?.(error);
         await db
@@ -5353,6 +5382,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             and(
               eq(agentWakeupRequests.id, candidate.id),
               eq(agentWakeupRequests.status, "claimed"),
+              eq(agentWakeupRequests.claimedAt, now),
               isNull(agentWakeupRequests.runId),
             ),
           );

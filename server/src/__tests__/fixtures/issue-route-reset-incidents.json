@@ -1,0 +1,449 @@
+{
+  "LEA-1901": {
+    "issue": {
+      "id": "038ffde7-32af-4211-9e4d-5f9ac478638e",
+      "status": "blocked",
+      "statusVersion": 10,
+      "updatedAt": "2026-11-26T17:09:31.379Z",
+      "assigneeAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+      "assigneeUserId": null,
+      "executionPolicy": null,
+      "executionState": {
+        "status": "idle",
+        "monitor": {
+          "kind": "external_service",
+          "notes": "QA monitor",
+          "status": "cleared",
+          "clearedAt": "2026-11-26T16:19:33.670Z",
+          "timeoutAt": "2026-11-26T16:30:00.000Z",
+          "clearReason": "manual",
+          "externalRef": null,
+          "maxAttempts": 3,
+          "nextCheckAt": null,
+          "scheduledBy": "assignee",
+          "serviceName": "long-run",
+          "attemptCount": 0,
+          "recoveryPolicy": null,
+          "lastTriggeredAt": null
+        },
+        "reviewRequest": null,
+        "currentStageId": null,
+        "lastDecisionId": null,
+        "returnAssignee": null,
+        "currentStageType": null,
+        "completedStageIds": [],
+        "currentStageIndex": null,
+        "currentParticipant": null,
+        "lastDecisionOutcome": null
+      }
+    },
+    "source": {
+      "id": "b34ed4e1-eec2-4907-92ad-37cb0d803fc9",
+      "action": "issue.updated",
+      "entityType": "issue",
+      "entityId": "038ffde7-32af-4211-9e4d-5f9ac478638e",
+      "actorType": "agent",
+      "actorId": "e6d95886-f0ed-4708-b471-c32065d8eb20",
+      "details": {
+        "status": "in_progress",
+        "assigneeAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+        "assigneeUserId": null,
+        "executionPolicy": {
+          "mode": "normal",
+          "stages": [],
+          "monitor": {
+            "kind": "external_service",
+            "notes": "QA monitor",
+            "timeoutAt": "2026-11-26T16:30:00.000Z",
+            "externalRef": null,
+            "maxAttempts": 3,
+            "nextCheckAt": "2026-11-26T16:20:00.000Z",
+            "scheduledBy": "assignee",
+            "serviceName": "long-run",
+            "recoveryPolicy": null
+          },
+          "commentRequired": true
+        },
+        "executionState": {
+          "status": "idle",
+          "monitor": {
+            "kind": "external_service",
+            "notes": "QA monitor",
+            "status": "scheduled",
+            "clearedAt": null,
+            "timeoutAt": "2026-11-26T16:30:00.000Z",
+            "clearReason": null,
+            "externalRef": null,
+            "maxAttempts": 3,
+            "nextCheckAt": "2026-11-26T16:20:00.000Z",
+            "scheduledBy": "assignee",
+            "serviceName": "long-run",
+            "attemptCount": 0,
+            "recoveryPolicy": null,
+            "lastTriggeredAt": null
+          },
+          "reviewRequest": null,
+          "currentStageId": null,
+          "lastDecisionId": null,
+          "returnAssignee": null,
+          "currentStageType": null,
+          "completedStageIds": [],
+          "currentStageIndex": null,
+          "currentParticipant": null,
+          "lastDecisionOutcome": null
+        },
+        "_previous": {
+          "status": "in_review",
+          "assigneeAgentId": "e6d95886-f0ed-4708-b471-c32065d8eb20",
+          "executionPolicy": {
+            "mode": "normal",
+            "stages": [
+              {
+                "id": "082a7eba-09f5-4d90-aa40-d3f8366b40aa",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "c0a9246e-97c5-46a9-8285-9e6d9d20958a",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "97c6fbb7-ac1f-48dc-a30e-048477c53019"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^reviewed: [0-9a-f]{40}"
+              },
+              {
+                "id": "5eb05828-5024-4143-a90f-65d0cbbb60f3",
+                "type": "delivery",
+                "participants": [
+                  {
+                    "id": "22ab7046-6129-4ce2-b835-26ad3e3b5973",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "fc000d62-327e-4115-8c54-e734feacdb83"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}"
+              },
+              {
+                "id": "fc604552-461e-4252-beba-50d8872edb5d",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "6f2f3d84-8dd4-4427-baf8-df2bdbec625b",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "e6d95886-f0ed-4708-b471-c32065d8eb20"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^verified: [0-9a-f]{40}"
+              },
+              {
+                "id": "e49a2068-a7fb-46fc-958a-663f16617528",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "1de53eca-a201-42ff-993a-24cea112b3f1",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "f7094a71-a3c4-421d-877a-e1480058da0f"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^design-control: qa/design-control/LEA-\\d+\\.md соответствует"
+              }
+            ],
+            "commentRequired": true
+          },
+          "executionState": {
+            "status": "pending",
+            "monitor": null,
+            "reviewRequest": null,
+            "currentStageId": "fc604552-461e-4252-beba-50d8872edb5d",
+            "lastDecisionId": "57d8c46f-8d7b-4d35-b66b-83aa94c43f49",
+            "returnAssignee": {
+              "type": "agent",
+              "userId": null,
+              "agentId": "fc000d62-327e-4115-8c54-e734feacdb83"
+            },
+            "currentStageType": "review",
+            "completedStageIds": [
+              "082a7eba-09f5-4d90-aa40-d3f8366b40aa",
+              "5eb05828-5024-4143-a90f-65d0cbbb60f3"
+            ],
+            "currentStageIndex": 2,
+            "currentParticipant": {
+              "type": "agent",
+              "userId": null,
+              "agentId": "e6d95886-f0ed-4708-b471-c32065d8eb20"
+            },
+            "lastDecisionOutcome": "approved",
+            "changesRequestedCount": 0
+          },
+          "statusVersion": 8
+        },
+        "changes": {
+          "statusVersion": {
+            "to": 9,
+            "from": 8
+          }
+        }
+      },
+      "createdAt": "2026-11-26T16:15:00.823Z"
+    },
+    "later": [
+      {
+        "id": "1b93272b-4e81-48f4-b4c9-94d689b3ece8",
+        "createdAt": "2026-11-26T16:19:35.025Z"
+      }
+    ],
+    "decisions": [
+      {
+        "id": "5bb88bc2-183a-4595-b66b-4b8716b27e8a",
+        "stageId": "082a7eba-09f5-4d90-aa40-d3f8366b40aa",
+        "stageType": "review",
+        "actorAgentId": "97c6fbb7-ac1f-48dc-a30e-048477c53019",
+        "outcome": "approved",
+        "createdAt": "2026-11-26T16:06:28.396192+00:00",
+        "updatedAt": "2026-11-26T16:06:28.396192+00:00",
+        "body": "reviewed: 6c8ebec427deee3a950f94797a3615e1d74386cf"
+      },
+      {
+        "id": "57d8c46f-8d7b-4d35-b66b-83aa94c43f49",
+        "stageId": "5eb05828-5024-4143-a90f-65d0cbbb60f3",
+        "stageType": "delivery",
+        "actorAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+        "outcome": "approved",
+        "createdAt": "2026-11-26T16:11:25.361670+00:00",
+        "updatedAt": "2026-11-26T16:11:25.361670+00:00",
+        "body": "delivery: from=79336b0d57fc1326b85ef6d81c8c0d4764844a6a to=4957703fcd88ecd26755cb38dc12bf59eedd3d24 reviewed=6c8ebec427deee3a950f94797a3615e1d74386cf"
+      }
+    ]
+  },
+  "LEA-1928": {
+    "issue": {
+      "id": "8e63463f-6a19-4f70-af7c-93db1682a583",
+      "status": "blocked",
+      "statusVersion": 10,
+      "updatedAt": "2026-11-26T20:35:53.815Z",
+      "assigneeAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+      "assigneeUserId": null,
+      "executionPolicy": null,
+      "executionState": {
+        "status": "idle",
+        "monitor": {
+          "kind": "external_service",
+          "notes": "QA monitor",
+          "status": "cleared",
+          "clearedAt": "2026-11-26T20:35:11.434Z",
+          "timeoutAt": null,
+          "clearReason": "invalid_status",
+          "externalRef": null,
+          "maxAttempts": 3,
+          "nextCheckAt": null,
+          "scheduledBy": "assignee",
+          "serviceName": "long-run",
+          "attemptCount": 0,
+          "recoveryPolicy": null,
+          "lastTriggeredAt": null
+        },
+        "reviewRequest": null,
+        "currentStageId": null,
+        "lastDecisionId": null,
+        "returnAssignee": null,
+        "currentStageType": null,
+        "completedStageIds": [],
+        "currentStageIndex": null,
+        "currentParticipant": null,
+        "lastDecisionOutcome": null,
+        "changesRequestedCount": 0
+      }
+    },
+    "source": {
+      "id": "e4cde0f8-27c3-46b1-94ae-59a80670713a",
+      "action": "issue.updated",
+      "entityType": "issue",
+      "entityId": "8e63463f-6a19-4f70-af7c-93db1682a583",
+      "actorType": "agent",
+      "actorId": "e6d95886-f0ed-4708-b471-c32065d8eb20",
+      "details": {
+        "status": "in_progress",
+        "assigneeAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+        "assigneeUserId": null,
+        "executionPolicy": {
+          "mode": "normal",
+          "stages": [],
+          "monitor": {
+            "kind": "external_service",
+            "notes": "QA monitor",
+            "timeoutAt": null,
+            "externalRef": null,
+            "maxAttempts": 3,
+            "nextCheckAt": "2026-11-26T20:39:27Z",
+            "scheduledBy": "assignee",
+            "serviceName": "long-run",
+            "recoveryPolicy": null
+          },
+          "commentRequired": true
+        },
+        "executionState": {
+          "status": "idle",
+          "monitor": {
+            "kind": "external_service",
+            "notes": "QA monitor",
+            "status": "scheduled",
+            "clearedAt": null,
+            "timeoutAt": null,
+            "clearReason": null,
+            "externalRef": null,
+            "maxAttempts": 3,
+            "nextCheckAt": "2026-11-26T20:39:27Z",
+            "scheduledBy": "assignee",
+            "serviceName": "long-run",
+            "attemptCount": 0,
+            "recoveryPolicy": null,
+            "lastTriggeredAt": null
+          },
+          "reviewRequest": null,
+          "currentStageId": null,
+          "lastDecisionId": null,
+          "returnAssignee": null,
+          "currentStageType": null,
+          "completedStageIds": [],
+          "currentStageIndex": null,
+          "currentParticipant": null,
+          "lastDecisionOutcome": null
+        },
+        "_previous": {
+          "status": "in_review",
+          "assigneeAgentId": "e6d95886-f0ed-4708-b471-c32065d8eb20",
+          "executionPolicy": {
+            "mode": "normal",
+            "stages": [
+              {
+                "id": "2f0013b4-040c-47bd-903e-909a66686c68",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "4f77b8c0-1fc7-42c3-9a7e-f66bf12af04e",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "97c6fbb7-ac1f-48dc-a30e-048477c53019"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^reviewed: [0-9a-f]{40}"
+              },
+              {
+                "id": "7d16dc14-4af5-4e56-af7d-26b22aa812ba",
+                "type": "delivery",
+                "participants": [
+                  {
+                    "id": "ac371f0d-b6db-47c4-9135-a87ce4d6d4f3",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "fc000d62-327e-4115-8c54-e734feacdb83"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}"
+              },
+              {
+                "id": "2d267869-22fa-4e53-bde5-32b030491452",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "a2b1cd0b-f762-486c-b09a-50347ef53cbc",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "e6d95886-f0ed-4708-b471-c32065d8eb20"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^verified: [0-9a-f]{40}"
+              },
+              {
+                "id": "cce2af9c-b3cf-477b-a730-5653ec62d035",
+                "type": "review",
+                "participants": [
+                  {
+                    "id": "0aa2eec3-2f89-49ba-8c8e-802518b86b43",
+                    "type": "agent",
+                    "userId": null,
+                    "agentId": "f7094a71-a3c4-421d-877a-e1480058da0f"
+                  }
+                ],
+                "approvalsNeeded": 1,
+                "approvalCommentPattern": "^design-control: qa/design-control/LEA-\\d+\\.md соответствует"
+              }
+            ],
+            "commentRequired": true
+          },
+          "executionState": {
+            "status": "pending",
+            "monitor": null,
+            "reviewRequest": null,
+            "currentStageId": "2d267869-22fa-4e53-bde5-32b030491452",
+            "lastDecisionId": "aa12c8f1-ecfc-4171-9708-6d9c5e5c2aab",
+            "returnAssignee": {
+              "type": "agent",
+              "userId": null,
+              "agentId": "fc000d62-327e-4115-8c54-e734feacdb83"
+            },
+            "currentStageType": "review",
+            "completedStageIds": [
+              "2f0013b4-040c-47bd-903e-909a66686c68",
+              "7d16dc14-4af5-4e56-af7d-26b22aa812ba"
+            ],
+            "currentStageIndex": 2,
+            "currentParticipant": {
+              "type": "agent",
+              "userId": null,
+              "agentId": "e6d95886-f0ed-4708-b471-c32065d8eb20"
+            },
+            "lastDecisionOutcome": "approved",
+            "changesRequestedCount": 0
+          },
+          "statusVersion": 8
+        },
+        "changes": {
+          "statusVersion": {
+            "to": 9,
+            "from": 8
+          }
+        }
+      },
+      "createdAt": "2026-11-26T20:32:30.585Z"
+    },
+    "later": [
+      {
+        "id": "9d417bb3-8707-40f6-abee-d3bea53bd08a",
+        "createdAt": "2026-11-26T20:35:11.661Z"
+      }
+    ],
+    "decisions": [
+      {
+        "id": "22588e79-8b00-46b8-9cbb-eb9475211a62",
+        "stageId": "2f0013b4-040c-47bd-903e-909a66686c68",
+        "stageType": "review",
+        "actorAgentId": "97c6fbb7-ac1f-48dc-a30e-048477c53019",
+        "outcome": "approved",
+        "createdAt": "2026-11-26T20:25:17.072147+00:00",
+        "updatedAt": "2026-11-26T20:25:17.072147+00:00",
+        "body": "reviewed: 2b1e817ea2afde6e6588a4faeeabd71502b167f5"
+      },
+      {
+        "id": "aa12c8f1-ecfc-4171-9708-6d9c5e5c2aab",
+        "stageId": "7d16dc14-4af5-4e56-af7d-26b22aa812ba",
+        "stageType": "delivery",
+        "actorAgentId": "fc000d62-327e-4115-8c54-e734feacdb83",
+        "outcome": "approved",
+        "createdAt": "2026-11-26T20:29:36.365099+00:00",
+        "updatedAt": "2026-11-26T20:29:36.365099+00:00",
+        "body": "delivery: from=c284dcee9d8f2ca4003760642ac9a9ee743adc8e to=cbb4c722ccbac09b71453e543b623255b85765b9 reviewed=2b1e817ea2afde6e6588a4faeeabd71502b167f5"
+      }
+    ]
+  }
+}

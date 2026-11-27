@@ -1997,6 +1997,8 @@ export {
   requiredQualityReviewSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionStateSchema,
+  issueRouteRestorationRequestSchema,
+  type IssueRouteRestorationRequest,
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,
   retryWorkspaceExportSchema,

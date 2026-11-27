@@ -506,7 +506,7 @@ function selectStageParticipant(
  * Rejects a stage approval whose comment lacks the stage's required evidence
  * line. The pattern checks the shape of the evidence, not its truth.
  */
-function assertApprovalCommentMatchesStagePattern(stage: IssueExecutionStage, commentBody: string) {
+export function assertApprovalCommentMatchesStagePattern(stage: IssueExecutionStage, commentBody: string) {
   const pattern = stage.approvalCommentPattern;
   if (!pattern) return;
   // Multiline so `^` anchors any line: the evidence line need not be first.
@@ -517,7 +517,7 @@ function assertApprovalCommentMatchesStagePattern(stage: IssueExecutionStage, co
   );
 }
 
-function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
+export function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
 }

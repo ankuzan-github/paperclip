@@ -1480,6 +1480,7 @@ Sandbox authentication and saved AI connections keep their existing flows.
 - `POST /issues/:issueId/checkout`
 - `POST /issues/:issueId/release`
 - `POST /issues/:issueId/admin/force-release` (board-only lock recovery)
+- `POST /issues/:issueId/execution-policy/restore-from-activity` (board-only route recovery)
 - `POST /issues/:issueId/comments`
 - `GET /issues/:issueId/comments`
 - `POST /companies/:companyId/issues/:issueId/attachments` (multipart upload)
@@ -1488,6 +1489,27 @@ Sandbox authentication and saved AI connections keep their existing flows.
 - `DELETE /attachments/:attachmentId`
 - `GET /issues/:issueId/runner-goal?agentId=...`
 - `POST /issues/:issueId/runner-goal/actions`
+
+Route recovery applies to a four-stage Architect → Delivery → QA → Product Designer
+route lost when scheduling an issue monitor. The operator needs company write access
+and read and mutation access to the task. Use the reset's `issue.updated` activity
+UUID and the agreed blocking issue UUID. The server reads the route, its pending
+stage and the original approvals from the task's journal.
+
+Send `{ "activityId": "<uuid>", "blockerIssueId": "<uuid>", "dryRun": true }`
+to inspect the four stage IDs, the QA and Designer assignments, the two approval IDs,
+the dependency and the expected version. After the operator has verified those facts,
+send the same IDs with `dryRun: false` and the returned `expectedVersion` object
+(`statusVersion` and `updatedAt`). A conflict requires a new preview and review
+of the changed facts. The preview has no side effects.
+
+The apply response contains the new version, `auditActivityId` and
+`wakeupRequestId`. The latter identifies the durable QA wake intent, whose
+dispatch goes through the ordinary scheduler. Application commits the restored
+route, the one dependency removal, the audit and the wake intent together. An
+identical apply request returns the stored receipt. Check that receipt if the
+connection fails after submission. The route has no reverse mutation. Reverting
+the server package leaves any committed issue changes in place.
 
 The runner-goal endpoints control an issue-scoped durable agent-session goal,
 not a row in the company `goals` hierarchy. Reads return the effective agent,

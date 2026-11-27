@@ -568,6 +568,29 @@ export const issueReviewRequestSchema = z
   })
   .strict();
 
+const issueRouteRestorationVersionSchema = z.object({
+  statusVersion: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  updatedAt: z.string().datetime(),
+}).strict();
+
+const issueRouteRestorationSourceSchema = z.object({
+  activityId: z.string().uuid().transform(id => id.toLowerCase()),
+  blockerIssueId: z.string().uuid().transform(id => id.toLowerCase()),
+});
+
+export const issueRouteRestorationRequestSchema = z.discriminatedUnion("dryRun", [
+  issueRouteRestorationSourceSchema.extend({
+    dryRun: z.literal(true),
+    expectedVersion: issueRouteRestorationVersionSchema.optional(),
+  }).strict(),
+  issueRouteRestorationSourceSchema.extend({
+    dryRun: z.literal(false),
+    expectedVersion: issueRouteRestorationVersionSchema,
+  }).strict(),
+]);
+
+export type IssueRouteRestorationRequest = z.infer<typeof issueRouteRestorationRequestSchema>;
+
 export const issueExecutionStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
   currentStageId: z.string().guid().nullable(),

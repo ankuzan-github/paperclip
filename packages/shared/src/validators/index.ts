@@ -444,6 +444,8 @@ export {
   requiredQualityReviewSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionStateSchema,
+  issueRouteRestorationRequestSchema,
+  type IssueRouteRestorationRequest,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   isValidExistingBranchName,
