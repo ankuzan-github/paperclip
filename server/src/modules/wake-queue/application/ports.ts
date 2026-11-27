@@ -90,6 +90,8 @@ export type DeferredWakeCandidate = {
   wakeReason: string | null;
   /** Exact failed-chat retry authority revalidated by the transaction-bound adapter. */
   authorizedFailedChatRetry?: boolean;
+  /** The saved restoration no longer matches the locked issue. */
+  staleRestoredRoute?: boolean;
 };
 
 export type PromoteDeferredWakeInput = {

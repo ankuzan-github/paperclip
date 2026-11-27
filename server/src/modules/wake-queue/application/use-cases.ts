@@ -170,6 +170,14 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    if (candidate.staleRestoredRoute) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
+        reason: "Restored route is no longer current", now: input.now,
+      });
+      continue;
+    }
+
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
       preservedWakeIds.push(candidate.id);
       continue;

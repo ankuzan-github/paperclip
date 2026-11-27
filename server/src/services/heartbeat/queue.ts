@@ -3457,6 +3457,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const restoredExecutionStage = restoreWakeReceipt
             ? await readRestoredRouteWakeContext(tx as unknown as Db, {
                 companyId: issue.companyId, issueId: issue.id, restorationActivityId: restoreWakeReceipt.id,
+                agentId, statusVersion: Number(payload?.restoredStatusVersion),
               })
             : null;
           if (
@@ -3647,6 +3648,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             executionBlocker: Pick<NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, "recoveryActionId" | "cause" | "nextAction">,
           ) => {
             if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
+            // A reconciliation hold may clear without a run releasing the
+            // issue. Let the outbox retry the full restored-route admission.
+            if (restoreWakeReceipt) return { kind: "deferred" as const };
             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
             const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
             if (executionWaitRequestId) {

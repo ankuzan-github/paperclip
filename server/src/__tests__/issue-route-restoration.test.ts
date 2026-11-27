@@ -412,15 +412,25 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).toHaveLength(0);
   });
 
-  it.each(["maxDailyRuns", "maxDailyCostCents", "dependency"] as const)("retries the same QA wake after temporary %s refusal", async gate => {
+  it.each(["maxDailyRuns", "maxDailyCostCents", "dependency", "execution recovery"] as const)("retries the same QA wake after temporary %s refusal", async gate => {
     const f = await seed();
     const { body: { expectedVersion } } = await f.preview().expect(200);
     const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const holdId = randomUUID();
     const setGate = async (blocked: boolean) => {
       if (gate === "dependency") {
         await app(f.board).patch(`/api/issues/${f.issueId}`).send({
           blockedByIssueIds: blocked ? [f.resolvedIssueId, f.blockerIssueId] : [f.resolvedIssueId],
         }).expect(200);
+      } else if (gate === "execution recovery") {
+        if (blocked) {
+          await db.insert(issueRecoveryActions).values({
+            id: holdId, companyId: f.companyId, sourceIssueId: f.issueId,
+            cause: "uncertain_provider_action", kind: "test", fingerprint: holdId, nextAction: "Reconcile execution",
+          });
+        } else {
+          await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, holdId));
+        }
       } else {
         await db.update(agents).set({ runtimeConfig: {
           heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1, [gate]: blocked ? 0 : 5 },
@@ -463,6 +473,84 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     ]));
     expect(await wakes(f.issueId)).toHaveLength(2);
     expect(await audits(f.issueId)).toHaveLength(1);
+  }, 30_000);
+
+  it.each([
+    { scenario: "route unchanged", replacePolicy: false, independentWake: false },
+    { scenario: "route replaced by the Board", replacePolicy: true, independentWake: false },
+    { scenario: "route replaced with another wake waiting", replacePolicy: true, independentWake: true },
+  ])("revalidates the restored QA wake after an active run ($scenario)", async ({ replacePolicy, independentWake }) => {
+    const reviewRequest = { instructions: "Verify the restored route before approving." };
+    const f = await seed("LEA-1928", false, reviewRequest);
+    const { body: { expectedVersion } } = await f.preview().expect(200);
+    const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const heartbeat = heartbeatService(db);
+    const dispatch = { companyId: f.companyId, requestId: applied.wakeupRequestId };
+    const readReceipt = async () => (await wakes(f.issueId)).find(wake => wake.id === applied.auditActivityId);
+    let finishQa!: () => void;
+    const qaFinished = new Promise<void>(resolve => { finishQa = resolve; });
+    invokeAdapter.mockImplementationOnce(async () => {
+      await qaFinished;
+      return isolatedAdapterResult;
+    });
+
+    try {
+      const active = await heartbeat.wakeup(f.qa, {
+        reason: "manual_qa",
+        contextSnapshot: { issueId: f.issueId },
+      });
+      await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
+      expect(await readIssue(f.issueId)).toMatchObject({ executionRunId: active?.id });
+      await heartbeat.dispatchPendingNativeStatusWakeups(dispatch);
+      expect(await readReceipt()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(invokeAdapter).toHaveBeenCalledOnce();
+
+      if (independentWake) {
+        await heartbeat.wakeup(f.qa, {
+          reason: "independent_qa",
+          contextSnapshot: { issueId: f.issueId, forceFreshSession: true },
+          idempotencyKey: "independent-qa",
+        });
+        expect(await wakes(f.issueId)).toContainEqual(expect.objectContaining({
+          idempotencyKey: "independent-qa", status: "deferred_issue_execution", runId: null,
+        }));
+      }
+      if (replacePolicy) {
+        const before = await readIssue(f.issueId);
+        const executionPolicy = structuredClone(f.policy);
+        executionPolicy.stages[2].approvalCommentPattern = "^new-qa-verdict:";
+        await app(f.board).patch(`/api/issues/${f.issueId}`).send({ executionPolicy }).expect(200);
+        expect(await readIssue(f.issueId)).toMatchObject({
+          status: before.status, statusVersion: before.statusVersion,
+          assigneeAgentId: f.qa, executionPolicy,
+        });
+      }
+    } finally {
+      finishQa();
+      await heartbeat.drainActiveRunExecutions();
+    }
+
+    if (replacePolicy) {
+      expect(await readReceipt()).toMatchObject({
+        status: "cancelled", runId: null, error: "Restored route is no longer current", finishedAt: expect.any(Date),
+      });
+      expect(invokeAdapter).toHaveBeenCalledTimes(independentWake ? 2 : 1);
+      if (independentWake) {
+        const receipt = (await wakes(f.issueId)).find(wake => wake.idempotencyKey === "independent-qa");
+        expect(receipt).toMatchObject({ status: "completed", runId: invokeAdapter.mock.calls[1][0].runId });
+      }
+    } else {
+      const restored = invokeAdapter.mock.calls[1]?.[0];
+      expect(await readReceipt()).toMatchObject({ status: "completed", runId: restored?.runId });
+      expect(restored?.context).toMatchObject({
+        wakeReason: "issue_execution_policy_restored",
+        paperclipWake: { executionStage: { stageId: f.policy.stages[2].id, reviewRequest } },
+      });
+      expect(invokeAdapter.mock.calls.filter(([context]) => context.context.wakeReason === "issue_execution_policy_restored"))
+        .toHaveLength(1);
+    }
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups(dispatch))
+      .toEqual({ scanned: 0, dispatched: 0, recovered: 0, deferred: 0 });
   }, 30_000);
 
   it("returns one durable receipt for simultaneous applies", async () => {

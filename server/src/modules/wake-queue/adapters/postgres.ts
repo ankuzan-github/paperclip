@@ -15,7 +15,7 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import type { Db } from "@paperclipai/db";
@@ -50,6 +50,7 @@ import { issueRecoveryActionService } from "../../../services/issue-recovery-act
 import { readContinuationAttempt } from "../../../services/recovery/run-liveness-continuations.js";
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { ISSUE_ROUTE_RESTORATION_WAKE, isRestoredRouteWakeReceipt, readRestoredRouteWakeContext } from "../../../services/issue-route-restoration-wake.js";
 import {
   queuedCommentIdsFromWakePayload,
   queuedCommentIdsFromRunContext,
@@ -238,7 +239,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
       while (true) {
         const row = await tx
-          .select()
+          .select({ ...getTableColumns(agentWakeupRequests), restoredRouteWake: isRestoredRouteWakeReceipt })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -255,6 +256,18 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
         const candidate = toDeferredWakeCandidate(row);
+        if (row.restoredRouteWake) {
+          const { restorationActivityId, restoredStatusVersion } = candidate.payload;
+          const executionStage = restorationActivityId === row.id &&
+            typeof restoredStatusVersion === "number" && Number.isSafeInteger(restoredStatusVersion)
+            ? await readRestoredRouteWakeContext(tx, {
+                companyId, issueId, agentId: row.agentId, restorationActivityId, statusVersion: restoredStatusVersion,
+              })
+            : null;
+          if (!executionStage) return { ...candidate, staleRestoredRoute: true };
+          candidate.reason = ISSUE_ROUTE_RESTORATION_WAKE;
+          candidate.deferredContextSeed = { ...candidate.deferredContextSeed, executionStage };
+        }
         try {
           const authorizedFailedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
@@ -948,6 +961,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            not(isRestoredRouteWakeReceipt),
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
             // wake instead of starting another one behind the receipt.
