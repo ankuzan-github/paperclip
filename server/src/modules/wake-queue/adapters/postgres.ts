@@ -1,3 +1,4 @@
+import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -232,7 +233,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       if (!agent) return null;
       const invokability = await evaluateAgentInvokabilityFromDb(tx, agent);
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable,
-        paused: !invokability.invokable && invokability.reason === "paused" };
+        paused: !invokability.invokable && invokability.reason === "paused",
+        wakeOnDemand: isHeartbeatWakeOnDemandEnabled(agent) };
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
@@ -483,7 +485,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .update(agentWakeupRequests)
         .set({
           status: "queued",
-          reason: "issue_execution_promoted",
+          reason: sql`case when ${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is not null
+            then ${agentWakeupRequests.reason} else 'issue_execution_promoted' end`,
           claimedAt: null,
           finishedAt: null,
           error: null,
@@ -948,6 +951,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A QA handoff owns its original stage context and comment.
+            sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is null`,
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
             // wake instead of starting another one behind the receipt.
@@ -1178,7 +1183,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         if (input.resumeStrandedQueue && (!run.finishedAt || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status))) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
-        const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        const context = parseObject(run.contextSnapshot);
+        const legacyIssueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+        const contextIssueId = run.nativeIssueId ?? run.issueId ?? (legacyIssueId && isUuidLike(legacyIssueId) ? legacyIssueId : null);
 
         // Lock the context issue (if any) and every issue that still references this
         // run, in id order, so two concurrent finalizations can never deadlock on
@@ -1321,7 +1328,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
-            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
+            and(isNull(heartbeatRuns.nativeIssueId), or(eq(heartbeatRuns.issueId, issueRow.id),
+              and(isNull(heartbeatRuns.issueId),
+                or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`,
+                  and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+                    sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueRow.id}`)))))),
           or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
               SELECT source.created_at, source.id FROM heartbeat_runs source

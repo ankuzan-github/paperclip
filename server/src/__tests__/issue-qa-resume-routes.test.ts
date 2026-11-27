@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -17,27 +17,20 @@ import {
   issueRelations,
   issues,
   issueThreadInteractions,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { getServerAdapter, registerServerAdapter } from "../adapters/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
-import { startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import type { StorageService } from "../storage/types.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-
-const { wakeup } = vi.hoisted(() => ({ wakeup: vi.fn() }));
-vi.mock("../services/heartbeat.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../services/heartbeat.js")>();
-  return { ...actual, heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => ({
-    ...actual.heartbeatService(...args),
-    wakeup,
-  }) };
-});
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -75,12 +68,9 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     app.use(errorHandler);
   });
 
-  beforeEach(() => {
-    wakeup.mockReset().mockResolvedValue(null);
-  });
-
   afterAll(async () => {
     vi.unstubAllEnvs();
+    await db?.$client.end({ timeout: 1 });
     await temporary?.cleanup();
   });
 
@@ -167,6 +157,10 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       decisions: await history(),
       comments: await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
       audit: await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)),
+      wakes: await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      )),
     });
     const authorization = (ownerRun: string = runId) => `Bearer ${createLocalAgentJwt(implementer, companyId, "process", ownerRun)}`;
     const path = `/api/issues/${identifier}/resume-execution-stage`;
@@ -178,7 +172,7 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     return { issueId, runId, marker, answer, executionPolicy, executionState, body, path, authorization, resume, snapshot };
   }
 
-  it("advertises PATCH on OPTIONS and resumes the same QA once, committing before the stage wake", async () => {
+  it("advertises PATCH on OPTIONS and atomically saves the resumed stage and one QA wake", async () => {
     const f = await fixture();
     const options = await request(app).options(f.path).expect(200);
     expect(options.headers.allow).toContain("PATCH");
@@ -186,8 +180,6 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     await db.insert(issues).values({ id: blockerId, companyId, title: "Resolved defect", status: "done" });
     await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: f.issueId, type: "blocks" });
     const before = await f.snapshot();
-    let snapshotAtWake: Awaited<ReturnType<typeof f.snapshot>> | undefined;
-    wakeup.mockImplementationOnce(async () => { snapshotAtWake = await f.snapshot(); });
 
     const responses = await Promise.all([f.resume(), f.resume()]);
     expect(responses.map((res) => res.status).sort()).toEqual([200, 409]);
@@ -198,14 +190,12 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       executionState: { ...f.executionState, status: "pending" },
     });
     expect(response.body.executionPolicy).toEqual(f.executionPolicy);
-    expect(snapshotAtWake?.issue).toMatchObject({
-      status: "in_review", executionState: { ...f.executionState, status: "pending" },
-    });
-    expect(response.body.updatedAt).toBe(snapshotAtWake?.issue?.updatedAt.toISOString());
-    expect(snapshotAtWake?.decisions).toEqual(before.decisions);
-    expect(snapshotAtWake?.comments).toMatchObject([{ body: f.body.comment, authorAgentId: implementer, createdByRunId: f.runId }]);
-    expect(snapshotAtWake?.audit).toHaveLength(2);
-    expect(snapshotAtWake?.audit).toEqual(expect.arrayContaining([
+    const saved = await f.snapshot();
+    expect(response.body.updatedAt).toBe(saved.issue?.updatedAt.toISOString());
+    expect(saved.decisions).toEqual(before.decisions);
+    expect(saved.comments).toMatchObject([{ body: f.body.comment, authorAgentId: implementer, createdByRunId: f.runId }]);
+    expect(saved.audit).toHaveLength(2);
+    expect(saved.audit).toEqual(expect.arrayContaining([
       expect.objectContaining({
         action: "issue.updated", agentId: implementer, runId: f.runId,
         details: expect.objectContaining({
@@ -214,19 +204,23 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       }),
       expect.objectContaining({
         action: "issue.comment_added", agentId: implementer, runId: f.runId,
-        details: expect.objectContaining({ commentId: snapshotAtWake?.comments[0]?.id }),
+        details: expect.objectContaining({ commentId: saved.comments[0]?.id }),
       }),
     ]));
-    expect(wakeup).toHaveBeenCalledExactlyOnceWith(qa, expect.objectContaining({
-      source: "assignment", reason: "execution_review_requested",
-      payload: expect.objectContaining({ commentId: snapshotAtWake?.comments[0]?.id }),
-      contextSnapshot: expect.objectContaining({
-        issueId: f.issueId, source: "issue.execution_stage",
-        executionStage: expect.objectContaining({
-          stageId: f.body.stageId, wakeRole: "reviewer", allowedActions: ["approve", "request_changes"],
-        }),
-      }),
-    }));
+    expect(saved.wakes).toMatchObject([{
+      agentId: qa, source: "assignment", reason: "execution_review_requested",
+      requestedByActorType: "agent", requestedByActorId: implementer,
+      status: "deferred_issue_execution", runId: null,
+      payload: {
+        commentId: saved.comments[0]?.id,
+        _paperclipWakeContext: {
+          issueId: f.issueId, source: "issue.execution_stage",
+          executionStage: {
+            stageId: f.body.stageId, wakeRole: "reviewer", allowedActions: ["approve", "request_changes"],
+          },
+        },
+      },
+    }]);
   });
 
   it("accepts the historical decision only for its exact task identifier", async () => {
@@ -234,7 +228,7 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     await expectRejection(f, 403, f.body, "issue_qa_resume_ceo_response_required");
     await db.update(issues).set({ identifier: "LEA-1880" }).where(eq(issues.id, f.issueId));
     await f.resume(f.body, f.authorization(), f.path.replace("LEA-1881", "LEA-1880")).expect(200);
-    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect((await f.snapshot()).wakes).toHaveLength(1);
   });
 
   it.each(["todo", "cancelled"] as const)("rejects a %s blocker without writes", async (status) => {
@@ -296,7 +290,6 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     const response = await f.resume(f.body, f.authorization(anotherRun)).expect(409);
     expect(response.body.details?.code).toBe("issue_qa_resume_run_not_owner");
     expect(await f.snapshot()).toEqual(before);
-    expect(wakeup).not.toHaveBeenCalled();
   });
 
   it("refuses an execution lock held by a run admitted to another task", async () => {
@@ -311,7 +304,6 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     const response = await f.resume(f.body, f.authorization(run!.id)).expect(409);
     expect(response.body.details?.code).toBe("issue_qa_resume_run_not_owner");
     expect(await f.snapshot()).toEqual(before);
-    expect(wakeup).not.toHaveBeenCalled();
   });
 
   it("accepts a current execution behind a finished checkout", async () => {
@@ -369,7 +361,6 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     expect(after).toEqual({ ...before, issue: {
       ...before.issue, executionState: { ...f.executionState, [field]: decision },
     } });
-    expect(wakeup).not.toHaveBeenCalled();
   });
 
   it("rolls back its comment when the saved participant cannot receive the issue", async () => {
@@ -387,76 +378,199 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     await expectRejection(f, 409, f.body, "issue_qa_resume_snapshot_changed");
   });
 
-  it("recovers one deferred QA run with its stage context after the outgoing run misses finalization", async () => {
+  it("rolls back the saved wake when a later write in the transition fails", async () => {
     const f = await fixture();
-    const userId = randomUUID();
-    const previousQaRun = randomUUID();
-    const busyQaRun = randomUUID();
-    const now = new Date();
-    await db.insert(authUsers).values({
-      id: userId, name: "Test Operator", email: `${userId}@example.test`, createdAt: now, updatedAt: now,
-    });
-    await db.insert(companyMemberships).values({
-      companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "admin",
-    });
-    await db.update(issues).set({ responsibleUserId: userId }).where(eq(issues.id, f.issueId));
-    await db.update(heartbeatRuns).set({ responsibleUserId: userId, startedAt: now }).where(eq(heartbeatRuns.id, f.runId));
-    await db.update(agents).set({
-      adapterType: "codex_local", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
-    }).where(eq(agents.id, qa));
-    await db.insert(heartbeatRuns).values({
-      id: previousQaRun, companyId, agentId: qa, issueId: f.issueId, status: "succeeded",
-      responsibleUserId: userId, finishedAt: new Date("2026-11-26T03:00:00Z"),
-    });
-    await db.update(issueExecutionDecisions).set({ createdByRunId: previousQaRun })
-      .where(eq(issueExecutionDecisions.id, f.body.returnDecisionId));
-
-    const adapter = getServerAdapter("codex_local");
-    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, resultJson: {} }));
-    const queueDb = createDb(temporary.connectionString);
-    const { heartbeatService } = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
-    startTaskDrain();
-    registerServerAdapter({ ...adapter, execute });
+    const before = await f.snapshot();
+    await db.execute(sql`
+      create function fail_qa_resume_audit() returns trigger language plpgsql as $$
+      begin
+        if exists (select 1 from agent_wakeup_requests
+          where payload->>'issueId' = new.entity_id and payload->>'qaResumeReturnDecisionId' is not null)
+        then raise exception 'Failure after saving the QA wake';
+        end if;
+        return new;
+      end
+      $$
+    `);
+    await db.execute(sql`
+      create trigger fail_qa_resume_audit before insert on activity_log
+      for each row when (new.action = 'issue.comment_added') execute function fail_qa_resume_audit()
+    `);
     try {
-      wakeup.mockImplementation(heartbeatService(queueDb).wakeup);
-      await f.resume().expect(200);
-      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, qa));
-      expect(receipt).toMatchObject({ status: "deferred_issue_execution" });
-
-      // Persist the outgoing run's terminal state without its normal queue release.
-      // An unrelated running QA turn keeps the recovered run queued for inspection.
-      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
-      await db.insert(heartbeatRuns).values({
-        id: busyQaRun, companyId, agentId: qa, responsibleUserId: userId, status: "running", startedAt: new Date(),
-      });
-      stopTaskDrain();
-      const restarted = heartbeatService(queueDb);
-      const recovery = await restarted.sweepStaleIssueLocks({ companyId, issueId: f.issueId });
-      expect(recovery.cleared).toBe(1);
-      await restarted.resumeQueuedRuns();
-      await restarted.resumeQueuedRuns();
-
-      const qaRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, qa)))
-        .filter((run) => run.id !== previousQaRun && run.id !== busyQaRun);
-      expect(qaRuns).toHaveLength(1);
-      expect(qaRuns[0]).toMatchObject({
-        status: "queued",
-        contextSnapshot: {
-          issueId: f.issueId,
-          wakeReason: "execution_review_requested",
-          executionStage: {
-            stageId: f.body.stageId, stageType: "review", wakeRole: "reviewer",
-            allowedActions: ["approve", "request_changes"],
-          },
-        },
-      });
-      expect(execute).not.toHaveBeenCalled();
+      await f.resume().expect(500);
+      expect(await f.snapshot()).toEqual(before);
     } finally {
-      stopTaskDrain();
-      registerServerAdapter(adapter);
-      await queueDb.$client.end();
+      await db.execute(sql`drop trigger fail_qa_resume_audit on activity_log`);
+      await db.execute(sql`drop function fail_qa_resume_audit()`);
     }
   });
+
+  it.each(["stale return", "disabled wake-on-demand"] as const)("retires a deferred QA wake for a %s", async (scenario) => {
+    const f = await fixture();
+    const previousRuntime = await db.select({ runtimeConfig: agents.runtimeConfig }).from(agents)
+      .where(eq(agents.id, qa)).then((rows) => rows[0]!.runtimeConfig);
+    try {
+      await f.resume().expect(200);
+      if (scenario === "stale return") {
+        await db.update(issues).set({ executionState: {
+          ...f.executionState, status: "pending", lastDecisionId: randomUUID(),
+        } }).where(eq(issues.id, f.issueId));
+      } else {
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, qa));
+      }
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+      await heartbeatService(db).resumeQueuedRuns();
+      expect((await f.snapshot()).wakes).toMatchObject([{
+        status: "cancelled", runId: null,
+        error: scenario === "stale return"
+          ? "The saved QA return no longer matches the pending stage"
+          : "On-demand wakes are disabled for the QA participant",
+      }]);
+    } finally {
+      await db.update(agents).set({ runtimeConfig: previousRuntime }).where(eq(agents.id, qa));
+    }
+  });
+
+  it.each(["legacy", "native"] as const)(
+    "recovers the original QA wake once when delivery behind a %s run fails before its first write",
+    async (runtimeMode) => {
+      const f = await fixture();
+      const userId = randomUUID();
+      const previousQaRun = randomUUID();
+      const busyQaRun = randomUUID();
+      const now = new Date();
+      await db.insert(authUsers).values({
+        id: userId, name: "Test Operator", email: `${userId}@example.test`, createdAt: now, updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "admin",
+      });
+      await db.update(issues).set({ responsibleUserId: userId }).where(eq(issues.id, f.issueId));
+      await db.update(heartbeatRuns).set({
+        responsibleUserId: userId, startedAt: now, contextSnapshot: {}, runtimeMode,
+        ...(runtimeMode === "native" ? { nativeIssueId: f.issueId, issueId: null } : {}),
+      }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(agents).set({
+        adapterType: "codex_local", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      }).where(eq(agents.id, qa));
+      await db.insert(heartbeatRuns).values({
+        id: previousQaRun, companyId, agentId: qa, issueId: f.issueId, status: "succeeded",
+        responsibleUserId: userId, createdAt: new Date("2026-11-26T02:58:00Z"),
+        finishedAt: new Date("2026-11-26T03:00:00Z"),
+      });
+      await db.update(issueExecutionDecisions).set({ createdByRunId: previousQaRun })
+        .where(eq(issueExecutionDecisions.id, f.body.returnDecisionId));
+
+      const adapter = getServerAdapter("codex_local");
+      const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, resultJson: {} }));
+      const queueDb = createDb(temporary.connectionString);
+      const recoveryErrors: unknown[] = [];
+      const coordinator = createDeliveryWorkCoordinator({
+        owner: queueDb, canRun: () => true,
+        onError: (error) => { recoveryErrors.push(error); },
+      });
+      registerServerAdapter({ ...adapter, execute });
+      try {
+        const response = await f.resume().expect(200);
+        expect(response.body).toMatchObject({ status: "in_review", executionState: { status: "pending" } });
+        await f.resume().expect(409);
+        const saved = await f.snapshot();
+        expect(saved.comments).toHaveLength(1);
+        const commentId = saved.comments[0]!.id;
+
+        // Persist the outgoing run's terminal state without its normal queue release.
+        // An unrelated running QA turn keeps the recovered run queued for inspection.
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+        await db.insert(heartbeatRuns).values({
+          id: busyQaRun, companyId, agentId: qa, responsibleUserId: userId, status: "running", startedAt: new Date(),
+        });
+        if (runtimeMode === "native") {
+          await heartbeatService(queueDb).resumeQueuedRuns();
+          expect((await f.snapshot()).wakes).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
+          await db.insert(nativeRunFinalizations).values({
+            companyId, issueId: f.issueId, runId: f.runId, phase: "committed",
+          });
+        }
+        const [intent] = saved.wakes;
+        expect(saved.wakes).toMatchObject([{
+          status: "deferred_issue_execution", runId: null,
+          payload: {
+            commentId,
+            executionStage: {
+              stageId: f.body.stageId, stageType: "review", wakeRole: "reviewer",
+              allowedActions: ["approve", "request_changes"],
+            },
+          },
+        }]);
+        await db.execute(sql`
+          create function fail_qa_wake_delivery() returns trigger language plpgsql as $$
+          begin
+            raise exception 'Delivery unavailable before the first queue write';
+          end
+          $$
+        `);
+        await db.execute(sql`
+          create trigger fail_qa_wake_delivery before update on agent_wakeup_requests
+          for each row when (old.reason = 'execution_review_requested'
+            and old.status = 'deferred_issue_execution')
+          execute function fail_qa_wake_delivery()
+        `);
+        const failedDb = createDb(temporary.connectionString);
+        try {
+          const failedDelivery = heartbeatService(failedDb);
+          await failedDelivery.reconcileStrandedAssignedIssues({
+            companyId, issueId: f.issueId, skipRelatedRecovery: true,
+          });
+          expect((await f.snapshot()).wakes).toMatchObject([{ id: intent!.id, runId: null }]);
+          const beforeFailure = await f.snapshot();
+          await expect(failedDelivery.resumeQueuedRuns()).rejects.toMatchObject({
+            cause: { message: "Delivery unavailable before the first queue write" },
+          });
+          expect((await f.snapshot()).wakes).toEqual(beforeFailure.wakes);
+        } finally {
+          await failedDb.$client.end();
+          await db.execute(sql`drop trigger fail_qa_wake_delivery on agent_wakeup_requests`);
+          await db.execute(sql`drop function fail_qa_wake_delivery()`);
+        }
+
+        const restarted = heartbeatService(queueDb);
+        await Promise.all([
+          restarted.registerDeferredReceiptWork(coordinator, () => true).ready,
+          restarted.resumeQueuedRuns(),
+        ]);
+        await restarted.resumeQueuedRuns();
+
+        const qaRuns = (await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.agentId, qa),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
+        )));
+        expect(qaRuns).toHaveLength(1);
+        const { wakes } = await f.snapshot();
+        expect(wakes).toMatchObject([{
+          id: intent!.id,
+          runId: qaRuns[0]!.id,
+          reason: "execution_review_requested",
+          payload: { commentId, executionStage: intent!.payload?.executionStage },
+        }]);
+        expect(qaRuns[0]).toMatchObject({
+          wakeupRequestId: intent!.id,
+          status: "queued",
+          contextSnapshot: {
+            issueId: f.issueId,
+            wakeReason: "execution_review_requested",
+            commentId,
+            executionStage: intent!.payload?.executionStage,
+          },
+        });
+        expect(recoveryErrors).toEqual([]);
+        expect(execute).not.toHaveBeenCalled();
+      } finally {
+        await coordinator.stop();
+        registerServerAdapter(adapter);
+        await queueDb.$client.end();
+      }
+    },
+  );
 
   async function expectRejection(
     f: Awaited<ReturnType<typeof fixture>>,
@@ -468,6 +582,5 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     const response = await f.resume(body).expect(status);
     if (code) expect(response.body.details?.code).toBe(code);
     expect(await f.snapshot()).toEqual(before);
-    expect(wakeup).not.toHaveBeenCalled();
   }
 });
