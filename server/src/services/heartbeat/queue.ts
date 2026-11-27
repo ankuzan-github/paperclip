@@ -1967,16 +1967,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
-            AND (
-              live_issue_run.native_issue_id = ${issues.id}
-              OR (live_issue_run.native_issue_id IS NULL
-                AND live_issue_run.issue_id = ${issues.id})
-              OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id IS NULL
-                AND live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text)
-              OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id IS NULL
-                AND live_issue_run.context_snapshot->>'issueId' IS NULL
-                AND live_issue_run.context_snapshot->>'taskId' = ${issues.id}::text)
-            )
+            AND CASE WHEN ${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' IS NULL
+              THEN (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
+                OR live_issue_run.native_issue_id = ${issues.id})
+              ELSE (
+                live_issue_run.native_issue_id = ${issues.id}
+                OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id = ${issues.id})
+                OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id IS NULL
+                  AND coalesce(live_issue_run.context_snapshot->>'issueId',
+                    live_issue_run.context_snapshot->>'taskId') = ${issues.id}::text)
+              )
+            END
             AND live_issue_run.status IN ('queued', 'running', 'scheduled_retry'))`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
@@ -1997,12 +1998,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sourceVersion: sql<string>`${heartbeatRuns}.xmin::text`,
       }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId),
-        or(eq(heartbeatRuns.nativeIssueId, issueId),
-          and(isNull(heartbeatRuns.nativeIssueId), or(eq(heartbeatRuns.issueId, issueId),
-            and(isNull(heartbeatRuns.issueId),
-              or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-                and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
-                  sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}`)))))),
+        wake.payload?.qaResumeReturnDecisionId
+          ? or(eq(heartbeatRuns.nativeIssueId, issueId),
+              and(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.issueId, issueId)),
+              and(isNull(heartbeatRuns.nativeIssueId), isNull(heartbeatRuns.issueId),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+              and(isNull(heartbeatRuns.nativeIssueId), isNull(heartbeatRuns.issueId),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+                sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}`))
+          : and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+              or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${issueId}`)),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),

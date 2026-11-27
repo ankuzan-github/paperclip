@@ -1184,8 +1184,19 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
         const context = parseObject(run.contextSnapshot);
-        const legacyIssueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
-        const contextIssueId = run.nativeIssueId ?? run.issueId ?? (legacyIssueId && isUuidLike(legacyIssueId) ? legacyIssueId : null);
+        let contextIssueId = readNonEmptyString(context.issueId);
+        const boundIssueId = run.nativeIssueId ?? run.issueId ?? readNonEmptyString(context.taskId);
+        if (boundIssueId && boundIssueId !== contextIssueId && isUuidLike(boundIssueId)) {
+          // A QA handoff has already cleared the outgoing task locks. Its
+          // deferred wake still belongs to the task bound to that run.
+          const [qaWake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${boundIssueId}`,
+            sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is not null`,
+          )).limit(1);
+          if (qaWake) contextIssueId = boundIssueId;
+        }
 
         // Lock the context issue (if any) and every issue that still references this
         // run, in id order, so two concurrent finalizations can never deadlock on
@@ -1328,11 +1339,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
-            and(isNull(heartbeatRuns.nativeIssueId), or(eq(heartbeatRuns.issueId, issueRow.id),
-              and(isNull(heartbeatRuns.issueId),
-                or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`,
-                  and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
-                    sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueRow.id}`)))))),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`,
+            issueRow.status === "in_review" ? and(isNull(heartbeatRuns.nativeIssueId),
+              or(eq(heartbeatRuns.issueId, issueRow.id),
+                and(isNull(heartbeatRuns.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+                  sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueRow.id}`))) : undefined),
           or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
               SELECT source.created_at, source.id FROM heartbeat_runs source
