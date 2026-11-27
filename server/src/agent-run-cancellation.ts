@@ -7,9 +7,13 @@ export function agentRunWritesRevoked(run: {
   status: string;
   resultJson?: Record<string, unknown> | null;
 } | null | undefined): boolean {
+  const startupCancellation = run?.resultJson?.startupCancellation;
+  const budgetStop = startupCancellation && typeof startupCancellation === "object" && "budgetEnforcement" in startupCancellation
+    ? startupCancellation.budgetEnforcement : null;
   const cancellation = run?.resultJson?.executionCancellation;
-  return run?.status === "cancelled" || Boolean(cancellation && typeof cancellation === "object"
-    && "state" in cancellation && cancellation.state === "requested");
+  return run?.status === "cancelled" ||
+    (budgetStop !== null && typeof budgetStop === "object" && !Array.isArray(budgetStop)) ||
+    Boolean(cancellation && typeof cancellation === "object" && "state" in cancellation && cancellation.state === "requested");
 }
 
 /** The caller must supply its write transaction, so Stop and commit serialize. */
