@@ -16,7 +16,7 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import type { Db } from "@paperclipai/db";
@@ -1334,13 +1334,25 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // queued successor still owns the next turn, including during a late
         // finalization/stranded-queue retry under this issue lock. Another
         // agent's review participation retains its separate recovery path.
+        const reviewState = issueRow.status === "in_review" ? parseIssueExecutionState(issueRow.executionState) : null;
+        const hasSavedQaWake = reviewState?.status === "pending" && reviewState.currentStageType === "review" &&
+          reviewState.lastDecisionOutcome === "changes_requested" && issueRow.assigneeAgentId
+          ? exists(tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.companyId),
+            eq(agentWakeupRequests.agentId, issueRow.assigneeAgentId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
+            sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' = ${reviewState.lastDecisionId}`,
+            sql`${agentWakeupRequests.payload} #>> '{executionStage,stageId}' = ${reviewState.currentStageId}`,
+          )))
+          : undefined;
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
           input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`,
-            issueRow.status === "in_review" ? and(isNull(heartbeatRuns.nativeIssueId),
+            hasSavedQaWake ? and(hasSavedQaWake, isNull(heartbeatRuns.nativeIssueId),
               or(eq(heartbeatRuns.issueId, issueRow.id),
                 and(isNull(heartbeatRuns.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
                   sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueRow.id}`))) : undefined),

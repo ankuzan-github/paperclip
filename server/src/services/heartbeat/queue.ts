@@ -3404,6 +3404,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              executionState: issues.executionState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -4028,6 +4029,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
+          const reviewState = parseObject(issue.executionState);
+          // The saved review wake owns the next turn even between the source
+          // run's completion and promotion of the deferred wake.
+          const [savedQaWake] = issue.status === "in_review" && issue.assigneeAgentId === agentId &&
+            reviewState.status === "pending" && reviewState.currentStageType === "review" &&
+            reviewState.lastDecisionOutcome === "changes_requested"
+            ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined,
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' = ${reviewState.lastDecisionId}`,
+                sql`${agentWakeupRequests.payload} #>> '{executionStage,stageId}' = ${reviewState.currentStageId}`,
+              )).limit(1)
+            : [];
+
           // Availability is advisory: competing clicks may both read it before
           // admission. The existing issue lock serializes the run and deferred
           // receipt checks with the admission below, without another lock owner.
@@ -4037,6 +4055,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               throw new ContextCompactionError(compacting ? "already_pending" : "agent_busy",
                 compacting ? "The agent is already compacting its context." : "Available when the agent finishes its current run.");
             }
+            if (savedQaWake) throw new ContextCompactionError("agent_busy", "Available after the pending review.");
             const [pending] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
               inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]), isNull(agentWakeupRequests.runId),
@@ -4274,7 +4293,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          if (activeExecutionRun) {
+          if (activeExecutionRun || savedQaWake) {
             // The case ledger owns retry. Do not place its exact receipt in a
             // generic deferred queue that cannot retain handoff authority.
             if (caseRequest) return { kind: "deferred" as const };
@@ -4293,7 +4312,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             let followUp: false | { assignmentId: string; consumed: boolean } = false;
             let pendingFollowUps: typeof agentWakeupRequests.$inferSelect[] = [];
             if (agent.adapterType === "paperclip_runner" && ["openai_dot", "grok_bot", "muse"].includes(String(followUpProvider))
-                && bindingId && activeExecutionRun.agentId === agentId && issue.assigneeAgentId === agentId
+                && bindingId && activeExecutionRun?.agentId === agentId && !savedQaWake && issue.assigneeAgentId === agentId
                 && reason === "issue_commented" && wakeCommentId && opts.allowRunCoalescing !== false
                 && enrichedContextSnapshot.forceFreshSession !== true && !explicitResumeSession && !opts.manualUserWake
                 && !enrichedContextSnapshot.interactionId && !payload?.interactionId && !receiptRequest) {
@@ -4316,7 +4335,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   issueId: issue.id, commentId: wakeCommentId,
                 }));
             }
-            if (followUp) {
+            if (followUp && activeExecutionRun) {
               if (!followUp.consumed) await notifyDeferredExecutionWork(tx, { companyId: agent.companyId });
               const assignmentId = followUp.assignmentId;
               const pending = followUp.consumed ? undefined : pendingFollowUps.find(wake =>
@@ -4353,13 +4372,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 agentId,
                 agentNameKey,
                 issueExecutionAgentNameKey: issue.executionAgentNameKey,
-                activeExecutionRun: {
+                activeExecutionRun: activeExecutionRun && !savedQaWake ? {
                   id: activeExecutionRun.id,
                   agentId: activeExecutionRun.agentId,
                   status: activeExecutionRun.status,
                   contextSnapshot: activeExecutionRun.contextSnapshot,
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
-                },
+                } : null,
                 allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
                 durableReceipt: receiptRequest
                   ? {

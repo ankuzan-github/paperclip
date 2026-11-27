@@ -808,7 +808,8 @@ export type AdmitWakeBehindIssueExecutionInput = {
   agentId: string;
   agentNameKey: string | null;
   issueExecutionAgentNameKey: string | null;
-  activeExecutionRun: WakeAdmissionActiveExecutionRun;
+  /** The current run, or null when a saved stage wake has priority. */
+  activeExecutionRun: WakeAdmissionActiveExecutionRun | null;
   allowRunCoalescing?: boolean;
   durableReceipt?: DurableWakeAdmissionReceipt;
   reason?: string | null;
@@ -828,10 +829,8 @@ export type AdmitWakeBehindIssueExecutionInput = {
 export type { AdmitWakeBehindIssueExecutionResult };
 
 /**
- * Decides and applies the admission outcome for a wake that arrives while
- * an active execution run already holds the issue's execution lock: merge
- * it into that run (coalesce), hold it behind the run (defer), or leave it
- * for the caller to queue as an ordinary wake (proceed).
+ * Admits incoming wakes behind an active run or a saved stage wake that
+ * already owns the next turn.
  */
 export function createAdmitWakeBehindIssueExecution(deps: {
   reader: WakeAdmissionReader;
@@ -848,9 +847,10 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         (input.requestedByActorType !== "user" || !manualUserWakeActorId)) {
       throw new Error("wake-queue: manual wake requires an authenticated user");
     }
-    const isSameExecutionAgent = await deps.reader.isSameExecutionAgent(scope, {
+    const activeRun = input.activeExecutionRun;
+    const isSameExecutionAgent = activeRun !== null && await deps.reader.isSameExecutionAgent(scope, {
       companyId: input.companyId,
-      activeExecutionRunAgentId: input.activeExecutionRun.agentId,
+      activeExecutionRunAgentId: activeRun.agentId,
       issueExecutionAgentNameKey: input.issueExecutionAgentNameKey,
       agentNameKey: input.agentNameKey,
     });
@@ -858,28 +858,28 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // A manual click establishes a fresh execution identity. Even a matching
     // requester can have a different originating identity on an exact retry.
     const shouldDeferFollowupWake =
-      Boolean(manualUserWakeActorId) || deps.helpers.shouldDeferFollowupWakeForSameIssue({
-        activeRunStatus: input.activeExecutionRun.status,
+      Boolean(manualUserWakeActorId) || (activeRun !== null && deps.helpers.shouldDeferFollowupWakeForSameIssue({
+        activeRunStatus: activeRun.status,
         isSameExecutionAgent,
         wakeCommentId: input.wakeCommentId,
         forceFreshSession: input.forceFreshSession,
-      });
+      }));
     const shouldQueueFollowupForRunningWake =
+      activeRun?.status === "running" &&
+      isSameExecutionAgent &&
       deps.helpers.shouldQueueFollowupForRunningIssueWake({
         contextSnapshot: input.contextSnapshot,
         wakeCommentId: input.wakeCommentId,
-      }) &&
-      input.activeExecutionRun.status === "running" &&
-      isSameExecutionAgent;
+      });
     const availableActiveExecutionRun = isSameExecutionAgent
       ? deps.helpers.filterZombieCoalesceTarget(
-          input.activeExecutionRun,
+          activeRun,
           input.liveRunExecutions,
         )
-      : input.activeExecutionRun;
+      : activeRun;
 
     const sameDurableActor =
-      !input.durableReceipt ||
+      !activeRun || !input.durableReceipt ||
       (await deps.reader.matchesActiveWakeActor(scope, {
         companyId: input.companyId,
         wakeupRequestId: availableActiveExecutionRun?.wakeupRequestId ?? null,
@@ -888,18 +888,18 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       }));
     // A resolved card never merges with comments or another card.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
-    const qaResumeAwaitingDispatch = input.activeExecutionRun.status === "queued" &&
-      Boolean(readNonEmptyString(parseObject(input.activeExecutionRun.contextSnapshot).qaResumeReturnDecisionId));
-    const decision = decideWakeAdmission({
+    const qaResumeAwaitingDispatch = activeRun?.status === "queued" &&
+      Boolean(readNonEmptyString(parseObject(activeRun.contextSnapshot).qaResumeReturnDecisionId));
+    const decision = activeRun ? decideWakeAdmission({
       allowRunCoalescing: qaResumeAwaitingDispatch ||
-        wakeMustNotJoinActiveRun(input.activeExecutionRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
+        wakeMustNotJoinActiveRun(activeRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,
       shouldDeferFollowupWake,
       shouldQueueFollowupForRunningWake,
       availableActiveExecutionRunPresent: availableActiveExecutionRun !== null,
-    });
+    }) : { kind: "defer" as const };
 
     if (decision.kind === "proceed") return { kind: "proceed" };
 

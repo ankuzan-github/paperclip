@@ -655,6 +655,87 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     },
   );
 
+  it.each(["running", "succeeded"] as const)(
+    "does not admit a later board comment ahead of the saved QA handoff while the legacy source is %s",
+    async (sourceStatus) => {
+      const f = await fixture();
+      const userId = randomUUID();
+      const now = new Date();
+      await db.insert(authUsers).values({
+        id: userId, name: "Test Operator", email: `${userId}@example.test`, createdAt: now, updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "admin",
+      });
+      await db.update(issues).set({ responsibleUserId: userId }).where(eq(issues.id, f.issueId));
+      await db.update(heartbeatRuns).set({
+        responsibleUserId: userId, startedAt: now, contextSnapshot: {}, runtimeMode: "legacy",
+      }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(agents).set({
+        adapterType: "codex_local", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      }).where(eq(agents.id, qa));
+      await db.insert(heartbeatRuns).values({
+        companyId, agentId: qa, responsibleUserId: userId, status: "running", startedAt: now,
+      });
+
+      const afterResume = await f.resume().expect(200);
+      expect(afterResume.body).toMatchObject({ status: "in_review", checkoutRunId: null, executionRunId: null });
+      const saved = await f.snapshot();
+      expect(saved.wakes).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
+      const [intent] = saved.wakes;
+      const finishSource = () => db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, f.runId));
+      if (sourceStatus === "succeeded") await finishSource();
+
+      const [comment] = await db.insert(issueComments).values({
+        companyId, issueId: f.issueId, authorUserId: userId, authorType: "user", body: "A later board comment",
+      }).returning();
+      const findQaRuns = () => db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, qa), eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
+      ));
+      const queueDb = createDb(temporary.connectionString);
+      try {
+        const heartbeat = heartbeatService(queueDb);
+        await heartbeat.wakeup(qa, {
+          source: "automation", triggerDetail: "system", reason: "issue_commented",
+          payload: { issueId: f.issueId, commentId: comment!.id, mutation: "comment" },
+          contextSnapshot: {
+            issueId: f.issueId, taskId: f.issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+            source: "issue.comment", wakeReason: "issue_commented",
+          },
+          requestedByActorType: "user", requestedByActorId: userId,
+        });
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        expect(source?.status).toBe(sourceStatus);
+        expect(await findQaRuns()).toEqual([]);
+        const deferred = (await f.snapshot()).wakes;
+        expect(deferred).toHaveLength(2);
+        expect(deferred).toEqual(expect.arrayContaining([
+          intent,
+          expect.objectContaining({
+            status: "deferred_issue_execution", runId: null,
+            payload: expect.objectContaining({ commentId: comment!.id }),
+          }),
+        ]));
+
+        if (sourceStatus === "running") await finishSource();
+        await heartbeat.resumeQueuedRuns();
+        expect(await findQaRuns()).toMatchObject([{
+          wakeupRequestId: intent!.id,
+          status: "queued",
+          contextSnapshot: {
+            wakeReason: "execution_review_requested",
+            commentId: saved.comments[0]!.id,
+            executionStage: intent!.payload?.executionStage,
+          },
+        }]);
+      } finally {
+        await queueDb.$client.end();
+      }
+    },
+  );
+
   async function expectRejection(
     f: Awaited<ReturnType<typeof fixture>>,
     status: number,

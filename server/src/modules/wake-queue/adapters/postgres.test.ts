@@ -316,6 +316,35 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       .toMatchObject({ status: "deferred_issue_execution", runId: null });
   });
 
+  it.each([false, true])("recognizes a canonical-only successor when the pending review has a saved QA wake (%s)", async savedQaWake => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_review" });
+    const stageId = randomUUID();
+    const returnDecisionId = randomUUID();
+    await db.update(issues).set({
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+        currentParticipant: { type: "agent", agentId, userId: null }, returnAssignee: null,
+        lastDecisionId: returnDecisionId, lastDecisionOutcome: "changes_requested",
+      },
+    }).where(eq(issues.id, issueId));
+    const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ createdAt: new Date(0), finishedAt: new Date(1) }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, issueId, scopeKind: "issue", status: "succeeded", finishedAt: new Date(), contextSnapshot: {},
+    });
+    await seedDeferredWake({
+      companyId, agentId, issueId,
+      payload: savedQaWake ? { qaResumeReturnDecisionId: returnDecisionId, executionStage: { stageId } } : undefined,
+    });
+    const drain = vi.fn(async () => ({ outcome: { kind: "released" as const }, postCommitEffects: [] }));
+    await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock(
+      { companyId, runId, now: new Date(), resumeStrandedQueue: true }, drain,
+    );
+    expect(drain).toHaveBeenCalledTimes(savedQaWake ? 0 : 1);
+  });
+
   it("ignores a foreign company's run when rechecking a stranded queue", async () => {
     const companyId = await seedCompany();
     const foreignCompanyId = await seedCompany();

@@ -110,8 +110,9 @@ its QA participant assigned. The policy and decision history are preserved.
 The transaction also saves the execution-stage wake with the handoff comment.
 The deferred wake queue promotes that receipt after the outgoing run releases
 execution, including during restart recovery. Promotion checks that the same QA
-stage and return are still pending. The Cards client verifies the reviewed and
-delivered Git package before calling this endpoint.
+stage and return are still pending. Later comments queue behind the saved
+stage wake until it can run with its original context. The Cards client
+verifies the reviewed and delivered Git package before calling this endpoint.
 
 ## 3. Status Semantics
 
