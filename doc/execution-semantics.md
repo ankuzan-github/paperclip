@@ -97,9 +97,10 @@ The Cards fork exposes `PATCH /api/issues/:id/resume-execution-stage` to an
 assignee's authenticated task run. It requires `stageId`, `returnDecisionId`,
 `ceoInteractionId`, `statusVersion`, `updatedAt`, and `comment`. The write
 transaction checks the saved QA stage and return, task snapshot, dependency
-readiness, and the CEO's answered interaction on that task. The answer starts
-with `pc-resume-qa: LEA-<n> return=<decision-id>`. The LEA-1880 decision predates
-this format and is accepted by its specific return and interaction IDs.
+readiness, and the CEO's answered interaction on that task. The text in
+`restore_route` starts with `pc-resume-qa: LEA-<n> return=<decision-id>`.
+The LEA-1880 decision predates this format and accepts text in the same field
+for its specific task identifier, return ID, and interaction ID.
 A stale snapshot produces HTTP 409.
 
 The response is the issue in `in_review` with its saved QA stage pending and

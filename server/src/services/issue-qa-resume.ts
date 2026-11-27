@@ -101,8 +101,9 @@ export async function prepareIssueQaResume(
   const marker = `pc-resume-qa: ${issue.identifier} return=${decision.id}`;
   if (!interaction?.resolvedAt || interaction.createdAt < decision.createdAt || interaction.resolvedAt < interaction.createdAt ||
     !result.success || result.data.outcome || result.data.cancelled ||
-    !result.data.answers.some(({ otherText }) =>
-      otherText && (isHistoricalDecision || otherText.split(/\r?\n/, 1)[0]?.trim() === marker))) {
+    !result.data.answers.some(({ questionId, otherText }) =>
+      questionId === "restore_route" && otherText &&
+      (isHistoricalDecision || otherText.split(/\r?\n/, 1)[0]?.trim() === marker))) {
     throw forbidden("A confirmed CEO response for this QA return is required", {
       code: "issue_qa_resume_ceo_response_required",
     });
