@@ -13,6 +13,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import incidents from "./fixtures/issue-route-reset-incidents.json" with { type: "json" };
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 
 import type { AdapterExecutionContext } from "../adapters/index.js";
 
@@ -167,6 +168,91 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     return db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId),
       eq(activityLog.action, "issue.execution_policy_restored")));
   }
+
+  async function replaceQaPolicy(f: Awaited<ReturnType<typeof seed>>) {
+    const before = await readIssue(f.issueId);
+    const executionPolicy = structuredClone(f.policy);
+    executionPolicy.stages[2].approvalCommentPattern = "^new-qa-verdict:";
+    await app(f.board).patch(`/api/issues/${f.issueId}`).send({ executionPolicy }).expect(200);
+    expect(await readIssue(f.issueId)).toMatchObject({
+      status: before.status, statusVersion: before.statusVersion,
+      assigneeAgentId: f.qa, executionPolicy,
+    });
+  }
+
+  it.each([
+    { scenario: "route unchanged" },
+    { scenario: "route replaced by the Board", replacePolicy: true },
+    { scenario: "active QA uses the last daily run", dailyCap: true },
+  ])("retries the outbox after the active QA run ($scenario)", async ({ replacePolicy, dailyCap }) => {
+    const reviewRequest = { instructions: "Verify the restored route before approving." };
+    const f = await seed("LEA-1928", false, reviewRequest);
+    const { body: { expectedVersion } } = await f.preview().expect(200);
+    const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const heartbeat = heartbeatService(db);
+    const dispatch = { companyId: f.companyId, requestId: applied.wakeupRequestId };
+    const onDeferredDeadline = vi.fn();
+    const assertWaiting = async () => {
+      expect(await wakes(f.issueId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: dispatch.requestId, status: "queued", runId: null, claimedAt: null }),
+      ]));
+      expect((await wakes(f.issueId)).find(wake => wake.id === applied.auditActivityId)).toBeUndefined();
+      expect(invokeAdapter).toHaveBeenCalledOnce();
+    };
+    const setDailyCap = (maxDailyRuns: number) => db.update(agents).set({
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1, maxDailyRuns } },
+    }).where(eq(agents.id, f.qa));
+
+    if (dailyCap) await setDailyCap(1);
+    let finishQa!: () => void;
+    const qaFinished = new Promise<void>(resolve => { finishQa = resolve; });
+    invokeAdapter.mockImplementationOnce(async () => {
+      await qaFinished;
+      return isolatedAdapterResult;
+    });
+    try {
+      const active = await heartbeat.wakeup(f.qa, { reason: "manual_qa", contextSnapshot: { issueId: f.issueId } });
+      await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
+      expect(await readIssue(f.issueId)).toMatchObject({ executionRunId: active?.id });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ ...dispatch, onDeferredDeadline });
+      await assertWaiting();
+      expect(onDeferredDeadline).toHaveBeenCalledOnce();
+      if (replacePolicy) await replaceQaPolicy(f);
+    } finally {
+      finishQa();
+      await heartbeat.drainActiveRunExecutions();
+    }
+
+    const restarted = heartbeatService(db);
+    if (dailyCap) {
+      await restarted.dispatchPendingNativeStatusWakeups(dispatch);
+      await assertWaiting();
+      await setDailyCap(5);
+    }
+    try {
+      await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups(dispatch), restarted.dispatchPendingNativeStatusWakeups(dispatch)]);
+    } finally {
+      await Promise.all([heartbeat.drainActiveRunExecutions(), restarted.drainActiveRunExecutions()]);
+    }
+    const receipts = await wakes(f.issueId);
+    if (replacePolicy) {
+      expect(invokeAdapter).toHaveBeenCalledOnce();
+      expect(receipts.find(wake => wake.id === dispatch.requestId)).toMatchObject({
+        status: "skipped", runId: null, finishedAt: expect.any(Date),
+      });
+    } else {
+      const restored = invokeAdapter.mock.calls[1]?.[0];
+      expect(receipts.find(wake => wake.id === applied.auditActivityId)).toMatchObject({
+        status: "completed", runId: restored?.runId,
+      });
+      expect(restored?.context).toMatchObject({
+        wakeReason: "issue_execution_policy_restored",
+        paperclipWake: { executionStage: { stageId: f.policy.stages[2].id, reviewRequest } },
+      });
+      expect(invokeAdapter.mock.calls.filter(([context]) => context.context.wakeReason === "issue_execution_policy_restored"))
+        .toHaveLength(1);
+    }
+  }, 30_000);
 
   it.each([
     { name: "LEA-1901", reviewRequest: null },
@@ -513,10 +599,12 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
   }, 30_000);
 
   it.each([
-    { scenario: "route unchanged", replacePolicy: false, independentWake: false },
-    { scenario: "route replaced by the Board", replacePolicy: true, independentWake: false },
+    { scenario: "route unchanged" },
+    { scenario: "route replaced by the Board", replacePolicy: true },
     { scenario: "route replaced with another wake waiting", replacePolicy: true, independentWake: true },
-  ])("revalidates the restored QA wake after an active run ($scenario)", async ({ replacePolicy, independentWake }) => {
+    { scenario: "recovery hold clears after the active run", lateHold: true },
+    { scenario: "route replaced while held", lateHold: true, replacePolicy: true },
+  ])("revalidates a previously saved generic QA receipt ($scenario)", async ({ replacePolicy, independentWake, lateHold }) => {
     const reviewRequest = { instructions: "Verify the restored route before approving." };
     const f = await seed("LEA-1928", false, reviewRequest);
     const { body: { expectedVersion } } = await f.preview().expect(200);
@@ -524,6 +612,7 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     const heartbeat = heartbeatService(db);
     const dispatch = { companyId: f.companyId, requestId: applied.wakeupRequestId };
     const readReceipt = async () => (await wakes(f.issueId)).find(wake => wake.id === applied.auditActivityId);
+    const holdId = randomUUID();
     let finishQa!: () => void;
     const qaFinished = new Promise<void>(resolve => { finishQa = resolve; });
     invokeAdapter.mockImplementationOnce(async () => {
@@ -538,7 +627,22 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
       });
       await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
       expect(await readIssue(f.issueId)).toMatchObject({ executionRunId: active?.id });
-      await heartbeat.dispatchPendingNativeStatusWakeups(dispatch);
+      const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, dispatch.requestId));
+      // The previous admission path saved a separate receipt with the audit
+      // id, rewrote its reason and marked the original intent coalesced.
+      await db.transaction(async tx => {
+        await tx.insert(agentWakeupRequests).values({
+          id: applied.auditActivityId, companyId: f.companyId, agentId: f.qa,
+          source: intent.source, triggerDetail: intent.triggerDetail, reason: "issue_execution_deferred",
+          status: "deferred_issue_execution", requestedByActorType: "system",
+          requestedByActorId: `native-status-wake-dispatch:${intent.id}`, idempotencyKey: intent.idempotencyKey,
+          payload: { ...intent.payload, _paperclipWakeContext: {
+            issueId: f.issueId, wakeReason: "issue_execution_policy_restored", nativeStatusWakeIntentId: intent.id,
+            restorationActivityId: applied.auditActivityId, executionStage: { reviewRequest },
+          } },
+        });
+        await tx.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, intent.id));
+      });
       expect(await readReceipt()).toMatchObject({ status: "deferred_issue_execution", runId: null });
       expect(invokeAdapter).toHaveBeenCalledOnce();
 
@@ -552,19 +656,41 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
           idempotencyKey: "independent-qa", status: "deferred_issue_execution", runId: null,
         }));
       }
-      if (replacePolicy) {
-        const before = await readIssue(f.issueId);
-        const executionPolicy = structuredClone(f.policy);
-        executionPolicy.stages[2].approvalCommentPattern = "^new-qa-verdict:";
-        await app(f.board).patch(`/api/issues/${f.issueId}`).send({ executionPolicy }).expect(200);
-        expect(await readIssue(f.issueId)).toMatchObject({
-          status: before.status, statusVersion: before.statusVersion,
-          assigneeAgentId: f.qa, executionPolicy,
+      if (lateHold) {
+        await db.insert(issueRecoveryActions).values({
+          id: holdId, companyId: f.companyId, sourceIssueId: f.issueId,
+          cause: "uncertain_provider_action", kind: "test", fingerprint: holdId, nextAction: "Reconcile execution",
         });
       }
+      if (replacePolicy && !lateHold) await replaceQaPolicy(f);
     } finally {
       finishQa();
       await heartbeat.drainActiveRunExecutions();
+    }
+
+    if (lateHold) {
+      expect(await readIssue(f.issueId)).toMatchObject({ executionRunId: null });
+      expect(await readReceipt()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(invokeAdapter).toHaveBeenCalledOnce();
+      if (replacePolicy) {
+        await replaceQaPolicy(f);
+        expect(await readReceipt()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      }
+      await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, holdId));
+      const restarted = heartbeatService(db);
+      const workerErrors: unknown[] = [];
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true,
+        onError: error => { workerErrors.push(error); } });
+      try {
+        await restarted.registerDeferredReceiptWork(coordinator, () => true).ready;
+        await vi.waitFor(async () => {
+          expect(await readReceipt()).toMatchObject({ status: replacePolicy ? "cancelled" : "completed" });
+        }, { timeout: 5_000 });
+      } finally {
+        await coordinator.stop();
+        await restarted.drainActiveRunExecutions();
+      }
+      expect(workerErrors).toEqual([]);
     }
 
     if (replacePolicy) {
