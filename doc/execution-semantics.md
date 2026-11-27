@@ -104,8 +104,11 @@ A stale snapshot produces HTTP 409.
 
 The response is the issue in `in_review` with its saved QA stage pending and
 its QA participant assigned. The policy and decision history are preserved.
-The normal execution-stage wakeup follows the commit. The Cards client verifies
-the reviewed and delivered Git package before calling this endpoint.
+The transaction also saves the execution-stage wake with the handoff comment.
+The deferred wake queue promotes that receipt after the outgoing run releases
+execution, including during restart recovery. Promotion checks that the same QA
+stage and return are still pending. The Cards client verifies the reviewed and
+delivered Git package before calling this endpoint.
 
 ## 3. Status Semantics
 

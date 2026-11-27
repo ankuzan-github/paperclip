@@ -1967,16 +1967,26 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
-            AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
-              OR live_issue_run.native_issue_id = ${issues.id})
+            AND CASE WHEN ${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' IS NULL
+              THEN (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
+                OR live_issue_run.native_issue_id = ${issues.id})
+              ELSE (
+                live_issue_run.native_issue_id = ${issues.id}
+                OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id = ${issues.id})
+                OR (live_issue_run.native_issue_id IS NULL AND live_issue_run.issue_id IS NULL
+                  AND coalesce(live_issue_run.context_snapshot->>'issueId',
+                    live_issue_run.context_snapshot->>'taskId') = ${issues.id}::text)
+              )
+            END
             AND live_issue_run.status IN ('queued', 'running', 'scheduled_retry'))`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
+      const issueId = String(wake.payload?.issueId);
       const dependencyWake = isDependencyResolvedWakePayload(wake.payload);
       if (!dependencyWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+          !await readQueuedInteractionResponse(db, wake.companyId, issueId, wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -1988,8 +1998,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sourceVersion: sql<string>`${heartbeatRuns}.xmin::text`,
       }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
-        or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${String(wake.payload?.issueId)}`),
+        wake.payload?.qaResumeReturnDecisionId
+          ? or(eq(heartbeatRuns.nativeIssueId, issueId),
+              and(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.issueId, issueId)),
+              and(isNull(heartbeatRuns.nativeIssueId), isNull(heartbeatRuns.issueId),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+              and(isNull(heartbeatRuns.nativeIssueId), isNull(heartbeatRuns.issueId),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+                sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}`))
+          : and(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+              or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${issueId}`)),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -1998,13 +2016,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (latest.runtimeMode !== "legacy" && latest.runtimeMode !== "native") continue;
       if (wake.idempotencyKey?.startsWith("chat-inbound:")) {
         await resumeDeferredChatWake(db, { companyId: wake.companyId, agentId: wake.agentId,
-          issueId: String(wake.payload?.issueId), requestId: wake.id }).catch(err => {
+          issueId, requestId: wake.id }).catch(err => {
           scope.onError?.(err);
           logger.warn({ requestId: wake.id }, "saved chat source could not resume after recovery");
         });
         continue;
       }
-      const releaseSource = `${latest.companyId}:${String(wake.payload?.issueId)}:${latest.id}:${latest.sourceVersion}`;
+      const releaseSource = `${latest.companyId}:${issueId}:${latest.id}:${latest.sourceVersion}`;
       if (latest.runtimeMode === "native" && releasedNativeSources.has(releaseSource)) continue;
       if (latest.runtimeMode === "legacy") {
         if (latest.status === "cancelled" && !latest.startedAt) {
@@ -2012,7 +2030,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
           latest.errorCode === "execution_reconciliation_required";
-        if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+        if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, issueId)) {
           await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
             scope.onError?.(err);
             logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");

@@ -14771,7 +14771,7 @@ export function issueRoutes(
 
       const request: ResumeIssueExecutionStage = req.body;
       const publications: ActivityPublication[] = [];
-      const { issue, previousState, commentId } = await db.transaction(async (tx) => {
+      const issue = await db.transaction(async (tx) => {
         const locked = await svc.getByIdForUpdate(existing.id, tx);
         if (!locked || locked.companyId !== existing.companyId) throw notFound("Issue not found");
         const patch = await prepareIssueQaResume(tx, locked, request, actor);
@@ -14805,6 +14805,33 @@ export function issueRoutes(
           actorRunId: actor.runId,
         }, tx, publications);
         if (!updated) throw issueQaResumeSnapshotChanged();
+        const wake = buildExecutionStageWakeup({
+          issueId: locked.id,
+          previousState: parseIssueExecutionState(locked.executionState),
+          nextState: parseIssueExecutionState(updated.executionState),
+          interruptedRunId: null,
+          requestedByActorType: "agent",
+          requestedByActorId: actor.agentId,
+        });
+        if (!wake) throw issueQaResumeSnapshotChanged();
+
+        // The outgoing run still owns execution. Commit the successor's wake
+        // with the stage so release or restart can promote the same receipt.
+        const requestId = randomUUID();
+        await notifyDeferredExecutionWork(tx, { companyId: locked.companyId, requestId });
+        const { payload, contextSnapshot, ...wakeup } = wake.wakeup;
+        await tx.insert(agentWakeupRequests).values({
+          ...wakeup,
+          id: requestId,
+          companyId: locked.companyId,
+          agentId: wake.agentId,
+          status: "deferred_issue_execution",
+          payload: withQueuedCommentIdsInWakePayload({
+            ...payload,
+            qaResumeReturnDecisionId: request.returnDecisionId,
+            _paperclipWakeContext: { ...contextSnapshot, qaResumeReturnDecisionId: request.returnDecisionId },
+          }, [comment.id]),
+        });
         const activity = {
           ...actor,
           companyId: locked.companyId,
@@ -14838,32 +14865,9 @@ export function issueRoutes(
             authorizationReason,
           },
         }, publications);
-        return {
-          issue: updated,
-          previousState: parseIssueExecutionState(locked.executionState),
-          commentId: comment.id,
-        };
+        return updated;
       });
       for (const publication of publications) publishActivity(publication);
-
-      const wake = buildExecutionStageWakeup({
-        issueId: issue.id,
-        previousState,
-        nextState: parseIssueExecutionState(issue.executionState),
-        interruptedRunId: null,
-        requestedByActorType: "agent",
-        requestedByActorId: actor.agentId,
-      });
-      if (wake) {
-        // The queue can recover a deferred wake after a restart when it carries
-        // the saved comment. Keep the wake reason and stage context for QA.
-        await heartbeat.wakeup(wake.agentId, {
-          ...wake.wakeup,
-          payload: { ...wake.wakeup.payload, commentId },
-        }).catch((err) => {
-          logger.error({ err, issueId: issue.id, stageId: request.stageId }, "failed to wake resumed execution stage");
-        });
-      }
       res.json(issue);
     },
   );

@@ -1,3 +1,4 @@
+import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -232,7 +233,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       if (!agent) return null;
       const invokability = await evaluateAgentInvokabilityFromDb(tx, agent);
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable,
-        paused: !invokability.invokable && invokability.reason === "paused" };
+        paused: !invokability.invokable && invokability.reason === "paused",
+        wakeOnDemand: isHeartbeatWakeOnDemandEnabled(agent) };
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
@@ -483,7 +485,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .update(agentWakeupRequests)
         .set({
           status: "queued",
-          reason: "issue_execution_promoted",
+          reason: sql`case when ${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is not null
+            then ${agentWakeupRequests.reason} else 'issue_execution_promoted' end`,
           claimedAt: null,
           finishedAt: null,
           error: null,
@@ -948,6 +951,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A QA handoff owns its original stage context and comment.
+            sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is null`,
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
             // wake instead of starting another one behind the receipt.
@@ -1178,7 +1183,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         if (input.resumeStrandedQueue && (!run.finishedAt || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status))) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
-        const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        const context = parseObject(run.contextSnapshot);
+        let contextIssueId = readNonEmptyString(context.issueId);
+        const boundIssueId = run.nativeIssueId ?? run.issueId ?? readNonEmptyString(context.taskId);
+        if (boundIssueId && boundIssueId !== contextIssueId && isUuidLike(boundIssueId)) {
+          // A QA handoff has already cleared the outgoing task locks. Its
+          // deferred wake still belongs to the task bound to that run.
+          const [qaWake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${boundIssueId}`,
+            sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' is not null`,
+          )).limit(1);
+          if (qaWake) contextIssueId = boundIssueId;
+        }
 
         // Lock the context issue (if any) and every issue that still references this
         // run, in id order, so two concurrent finalizations can never deadlock on
@@ -1321,7 +1339,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
-            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`,
+            issueRow.status === "in_review" ? and(isNull(heartbeatRuns.nativeIssueId),
+              or(eq(heartbeatRuns.issueId, issueRow.id),
+                and(isNull(heartbeatRuns.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' is null`,
+                  sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueRow.id}`))) : undefined),
           or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
             input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
               SELECT source.created_at, source.id FROM heartbeat_runs source

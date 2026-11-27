@@ -11,6 +11,7 @@ import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
+  parseObject,
   readNonEmptyString,
 } from "../domain/values.js";
 import type {
@@ -175,6 +176,26 @@ async function runReleaseDrain(
       continue;
     }
 
+    const qaResumeReturnDecisionId = readNonEmptyString(candidate.payload.qaResumeReturnDecisionId);
+    if (qaResumeReturnDecisionId && (
+      issue.status !== "in_review" ||
+      issue.assigneeUserId ||
+      issue.assigneeAgentId !== candidate.agentId ||
+      issue.executionState?.currentStageType !== "review" ||
+      currentAgentParticipant(issue)?.agentId !== candidate.agentId ||
+      issue.executionState?.currentStageId !== parseObject(candidate.payload.executionStage).stageId ||
+      issue.executionState?.lastDecisionId !== qaResumeReturnDecisionId
+    )) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: "The saved QA return no longer matches the pending stage",
+        now: input.now,
+      });
+      continue;
+    }
+
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
     // comment ID so coalesced human or unrelated input is never hidden.
@@ -246,6 +267,16 @@ async function runReleaseDrain(
     const liveCommentIdsDiffer = liveness.liveNonSelfCommentIds.length !== candidate.queuedCommentIds.length;
 
     const deferredAgent = await ports.transaction.findInvokableAgent({ companyId: run.companyId, agentId: candidate.agentId });
+    if (qaResumeReturnDecisionId && deferredAgent?.wakeOnDemand === false) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: "On-demand wakes are disabled for the QA participant",
+        now: input.now,
+      });
+      continue;
+    }
     const pauseHold = await ports.transaction.getPauseHoldFacts({
       companyId: run.companyId,
       issueId: issue.id,
@@ -857,8 +888,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       }));
     // A resolved card never merges with comments or another card.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
+    const qaResumeAwaitingDispatch = input.activeExecutionRun.status === "queued" &&
+      Boolean(readNonEmptyString(parseObject(input.activeExecutionRun.contextSnapshot).qaResumeReturnDecisionId));
     const decision = decideWakeAdmission({
-      allowRunCoalescing: wakeMustNotJoinActiveRun(input.activeExecutionRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
+      allowRunCoalescing: qaResumeAwaitingDispatch ||
+        wakeMustNotJoinActiveRun(input.activeExecutionRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,

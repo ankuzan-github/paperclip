@@ -861,6 +861,35 @@ function createFakeAdmissionHelpers(
 }
 
 describe("admitWakeBehindIssueExecution", () => {
+  it("queues a later comment behind the saved QA wake until its first dispatch", async () => {
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader: createFakeAdmissionReader(),
+      writer,
+      helpers: createFakeAdmissionHelpers(),
+    });
+
+    const result = await admit(SCOPE, admissionInput({
+      activeExecutionRun: {
+        ...ACTIVE_EXECUTION_RUN,
+        status: "queued",
+        contextSnapshot: {
+          wakeReason: "execution_review_requested",
+          qaResumeReturnDecisionId: "saved-return",
+          commentId: "handoff-comment",
+        },
+      },
+      wakeCommentId: "later-comment",
+      payload: { issueId: "issue-1", commentId: "later-comment" },
+    }));
+
+    expect(result).toEqual({ kind: "deferred" });
+    expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+    expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(SCOPE, expect.objectContaining({
+      payload: expect.objectContaining({ commentId: "later-comment" }),
+    }));
+  });
+
   it.each(["running", "queued"])(
     "keeps a dedicated durable continuation separate from a %s execution and an existing deferred wake",
     async (status) => {

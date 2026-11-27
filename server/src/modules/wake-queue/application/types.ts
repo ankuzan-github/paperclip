@@ -59,6 +59,7 @@ export type InvokableAgentSnapshot = {
   name: string | null;
   invokable: boolean;
   paused?: boolean;
+  wakeOnDemand?: boolean;
 };
 
 /** A new heartbeat run reached the queued state and should be published and dispatched. */
