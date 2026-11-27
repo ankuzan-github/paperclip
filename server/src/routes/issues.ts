@@ -376,6 +376,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  buildExecutionStageWakeContext,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -533,16 +534,6 @@ type ActivityExecutionParticipant = Pick<
   NormalizedExecutionPolicy["stages"][number]["participants"][number],
   "type" | "agentId" | "userId"
 >;
-type ExecutionStageWakeContext = {
-  wakeRole: "reviewer" | "approver" | "deliverer" | "executor";
-  stageId: string | null;
-  stageType: ParsedExecutionState["currentStageType"];
-  currentParticipant: ParsedExecutionState["currentParticipant"];
-  returnAssignee: ParsedExecutionState["returnAssignee"];
-  reviewRequest: ParsedExecutionState["reviewRequest"];
-  lastDecisionOutcome: ParsedExecutionState["lastDecisionOutcome"];
-  allowedActions: string[];
-};
 type SuccessfulRunHandoffActivityRow = {
   entityId: string;
   action: string;
@@ -2184,23 +2175,6 @@ function isApprovalReviewComment(body: string) {
   );
 }
 
-function buildExecutionStageWakeContext(input: {
-  state: ParsedExecutionState;
-  wakeRole: ExecutionStageWakeContext["wakeRole"];
-  allowedActions: string[];
-}): ExecutionStageWakeContext {
-  return {
-    wakeRole: input.wakeRole,
-    stageId: input.state.currentStageId,
-    stageType: input.state.currentStageType,
-    currentParticipant: input.state.currentParticipant,
-    returnAssignee: input.state.returnAssignee,
-    reviewRequest: input.state.reviewRequest ?? null,
-    lastDecisionOutcome: input.state.lastDecisionOutcome,
-    allowedActions: input.allowedActions,
-  };
-}
-
 function summarizeIssueRelationForActivity(relation: {
   id: string;
   identifier: string | null;
@@ -2885,24 +2859,13 @@ function buildExecutionStageWakeup(input: {
       );
     if (!agentId || !stageChanged) return null;
 
-    // A delivery participant is the executor shipping reviewed work, not a
-    // reviewer of it: the wake must say so or the prompt tells it not to act.
     const reason =
       nextState.currentStageType === "approval"
         ? "execution_approval_requested"
         : nextState.currentStageType === "delivery"
           ? "execution_delivery_requested"
           : "execution_review_requested";
-    const executionStage = buildExecutionStageWakeContext({
-      state: nextState,
-      wakeRole:
-        nextState.currentStageType === "approval"
-          ? "approver"
-          : nextState.currentStageType === "delivery"
-            ? "deliverer"
-            : "reviewer",
-      allowedActions: ["approve", "request_changes"],
-    });
+    const executionStage = buildExecutionStageWakeContext(nextState);
 
     return {
       agentId,
@@ -2944,11 +2907,7 @@ function buildExecutionStageWakeup(input: {
       );
     if (!agentId || !becameChangesRequested) return null;
 
-    const executionStage = buildExecutionStageWakeContext({
-      state: nextState,
-      wakeRole: "executor",
-      allowedActions: ["address_changes", "resubmit"],
-    });
+    const executionStage = buildExecutionStageWakeContext(nextState);
 
     return {
       agentId,
