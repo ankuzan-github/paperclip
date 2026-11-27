@@ -1,6 +1,6 @@
 import { and, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import { activityLog, agents, issueExecutionDecisions, issueThreadInteractions, type Db, type issues } from "@paperclipai/db";
-import { askUserQuestionsResultSchema, issueExecutionPolicySchema, resubmitIssueExecutionReviewSchema } from "@paperclipai/shared";
+import { askUserQuestionsResultSchema, issueExecutionPolicySchema, resubmitIssueExecutionReviewSchema, type IssueExecutionDecision } from "@paperclipai/shared";
 import type { z } from "zod";
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
@@ -26,6 +26,36 @@ const HISTORICAL = {
 const HISTORICAL_APPROVAL = `Разрешаю один повторный проход LEA-2049 для опубликованного SHA ${HISTORICAL.sha} после возврата ${HISTORICAL.returnDecisionId}. Маршрут — review (Architect) → delivery → QA. Архитектор проверяет весь сдаваемый SHA и отдельно регрессии LEA-2095, LEA-2096 и LEA-2097. Доставка начинается после его одобрения, затем проходит QA.`;
 
 export const ISSUE_REVIEW_RESUBMISSION_CONSUMED = "issue.review_resubmission_consumed";
+
+export async function assertResubmittedReviewApproval(
+  db: Pick<Db, "select">,
+  issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+  decision: Pick<IssueExecutionDecision, "stageId" | "outcome" | "body"> | undefined,
+) {
+  if (issue.companyId !== CARDS_COMPANY_ID || decision?.outcome !== "approved") return;
+  const receipts = await db.select({
+    sha: sql<string | null>`${activityLog.details}->>'reviewedSha'`,
+  }).from(activityLog).where(and(
+    eq(activityLog.companyId, issue.companyId),
+    eq(activityLog.entityType, "issue"),
+    eq(activityLog.entityId, issue.id),
+    eq(activityLog.actorType, "system"),
+    eq(activityLog.action, ISSUE_REVIEW_RESUBMISSION_CONSUMED),
+    sql`${activityLog.details}->>'reviewStageId' = ${decision.stageId}::text`,
+  )).limit(2);
+  if (receipts.length === 0) return;
+
+  // Delivery reads the first reviewed SHA. A matching line later in the
+  // evidence must never authorize a different first SHA.
+  const sha = receipts[0]?.sha;
+  if (receipts.length !== 1 || !sha || !/^[0-9a-f]{40}$/.test(sha) ||
+    decision.body.split(/\r?\n/, 1)[0] !== `reviewed: ${sha}`) {
+    throw unprocessable("The first approval line must identify the SHA authorized for this review stage", {
+      code: "issue_review_resubmission_approval_sha_mismatch",
+      reviewedSha: receipts.length === 1 ? sha : undefined,
+    });
+  }
+}
 
 export function issueReviewResubmissionSnapshotChanged() {
   return conflict("The saved review return changed. Read the task again before resubmitting.", {

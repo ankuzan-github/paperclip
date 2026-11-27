@@ -11,6 +11,7 @@ import {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { activityRoutes } from "../routes/activity.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import type { StorageService } from "../storage/types.js";
@@ -69,6 +70,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
       next();
     });
     app.use("/api", issueRoutes(db, {} as StorageService));
+    app.use("/api", activityRoutes(db));
     app.use(errorHandler);
   });
 
@@ -252,6 +254,67 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     const restored = (await f.snapshot()).issue!;
     await f.rejectWithoutWrites(409, "issue_review_resubmission_already_used", {
       ...f.body, updatedAt: restored.updatedAt.toISOString(), statusVersion: restored.statusVersion,
+    });
+  });
+
+  it.each(["missing", "superseded"])("binds the legacy approval request to its stage when the submission comment is %s", async (commentState) => {
+    const f = await fixture();
+    const { body: started } = await f.call().expect(200);
+    const [review, delivery, verification] = started.executionPolicy.stages;
+    const otherSha = "a".repeat(40);
+    const issuePath = `/api/issues/${f.identifier}`;
+    const stageRun = async (agentId: string) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId, agentId, issueId: f.issueId, status: "running",
+        responsibleUserId: userId, runtimeMode: "legacy", startedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, f.issueId));
+      return { Authorization: `Bearer ${createLocalAgentJwt(agentId, companyId, "process", runId)}`, "X-Paperclip-Run-Id": runId };
+    };
+    const reviewerHeaders = await stageRun(reviewer);
+    const approve = (comment: string, headers = reviewerHeaders) => request(app).patch(issuePath)
+      .set(headers).send({ status: "done", comment });
+    const post = (body: string) => request(app).post(`${issuePath}/comments`)
+      .set(reviewerHeaders).send({ body });
+    if (commentState === "missing") {
+      const { comments } = await f.snapshot();
+      await db.delete(issueComments).where(eq(issueComments.id, comments[0]!.id));
+    } else {
+      await post(`submitted: ${otherSha} branch=pc/${f.identifier}`).expect(201);
+    }
+    const { body: activity } = await request(app).get(`${issuePath}/activity`).set(reviewerHeaders).expect(200);
+    expect(activity).toContainEqual(expect.objectContaining({
+      action: consumed, actorType: "system", details: expect.objectContaining({ reviewStageId: review.id, reviewedSha: sha }),
+    }));
+    const before = await f.snapshot();
+    const wrongFirst = `reviewed: ${otherSha}\n\nreviewed: ${sha}`;
+    for (const approval of [
+      approve(`reviewed: ${otherSha}`),
+      approve(wrongFirst),
+      post(`${wrongFirst}\n\n## Review: APPROVED`),
+    ]) {
+      const response = await approval.expect(422);
+      expect(response.body.details).toMatchObject({
+        code: "issue_review_resubmission_approval_sha_mismatch", reviewedSha: sha,
+      });
+      expect(await f.snapshot()).toEqual(before);
+    }
+    const { body: approved } = await approve(`reviewed: ${sha}\r\n\r\nVerified the changes.`).expect(200);
+    expect(approved).toMatchObject({
+      status: "in_review", assigneeAgentId: implementer,
+      executionState: { currentStageId: delivery.id, completedStageIds: [review.id] },
+    });
+    expect((await f.snapshot()).decisions).toContainEqual(expect.objectContaining({
+      stageId: review.id, outcome: "approved", body: expect.stringMatching(new RegExp(`^reviewed: ${sha}\\b`)),
+    }));
+    const { body: delivered } = await approve(
+      `delivery: from=${otherSha} to=${"b".repeat(40)} reviewed=${sha} not-required`,
+      await stageRun(implementer),
+    ).expect(200);
+    expect(delivered).toMatchObject({
+      status: "in_review", assigneeAgentId: qa,
+      executionState: { currentStageId: verification.id, completedStageIds: [review.id, delivery.id] },
     });
   });
 

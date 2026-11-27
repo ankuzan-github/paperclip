@@ -25,6 +25,7 @@ import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { issueQaResumeSnapshotChanged, prepareIssueQaResume, type ResumeIssueExecutionStage } from "../services/issue-qa-resume.js";
 import {
+  assertResubmittedReviewApproval,
   ISSUE_REVIEW_RESUBMISSION_CONSUMED,
   issueReviewResubmissionSnapshotChanged,
   prepareIssueReviewResubmission,
@@ -10938,6 +10939,7 @@ export function issueRoutes(
               allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
               commentBody: resolutionNote ?? null,
             });
+            await assertResubmittedReviewApproval(tx, lockedIssue, transition.decision);
             Object.assign(updateFields, transition.patch);
             if (transition.decision) {
               const decisionId = randomUUID();
@@ -15526,6 +15528,7 @@ export function issueRoutes(
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
+      await assertResubmittedReviewApproval(db, existing, transition.decision);
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -20361,6 +20364,7 @@ export function issueRoutes(
           },
           commentBody: req.body.body,
         });
+        await assertResubmittedReviewApproval(db, currentIssue, transition.decision);
         const decisionId = transition.decision ? randomUUID() : null;
         if (decisionId) {
           const nextExecutionState = transition.patch.executionState;
