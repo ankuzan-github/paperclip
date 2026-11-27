@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { currentProcessStartedAtMs, processExists, resetCurrentProcessStartedAtForTests } from "./controller-process-identity.js";
 import * as hotRestart from "./hot-restart.js";
+import { proveRunProcessGone } from "./run-process-owner.js";
 import {
   currentLocalOwnerStamp,
   currentDeploymentIdentity,
@@ -100,6 +101,36 @@ describe("proveOwnerGone: local owners", () => {
       .toEqual({ verdict: "unprovable", reason: "unknown_process_space" });
     expect(await proveOwnerGone(stamp(), probe({ processSpace: "unknown" })))
       .toEqual({ verdict: "unprovable", reason: "unknown_process_space" });
+  });
+
+  it("settles a legacy local child from an earlier boot of the same physical Mac without probing its PID", async () => {
+    const previous = { hardwareHash: "a".repeat(64), sessionHash: "1".repeat(64) };
+    const current = { ...previous, sessionHash: "2".repeat(64) };
+    const oldSpace = "a".repeat(32);
+    const newSpace = "b".repeat(32);
+    const pidExists = vi.fn(() => true);
+    const groupExists = vi.fn(() => true);
+    const localProbe = probe({ processSpace: newSpace, macKernelBoot: current, pidExists, processGroupExists: groupExists });
+    const savedController = { bootId: "old-controller", pid: 123, hostHash: oldSpace, processStartedAt: STARTED };
+    const child = { runtimeMode: "legacy" as const, processPid: 4242, processGroupId: 4242, processStartedAt: at(0),
+      processHostHash: oldSpace, controllerProcess: { ...savedController, macKernelBoot: previous } };
+
+    expect(await proveRunProcessGone(child, "test", localProbe)).toEqual({ verdict: "gone", reason: "mac_rebooted" });
+    for (const unverifiable of [
+      { ...child, processHostHash: "remote" },
+      { ...child, runtimeMode: "native" as const },
+      { ...child, controllerProcess: savedController },
+      { ...child, controllerProcess: { ...savedController, macKernelBoot: { ...previous, hardwareHash: "b".repeat(64) } } },
+      { ...child, controllerProcess: { ...savedController, macKernelBoot: current } },
+    ]) {
+      expect(await proveRunProcessGone(unverifiable, "test", localProbe))
+        .toEqual({ verdict: "unprovable", reason: "different_process_space" });
+    }
+    expect(pidExists).not.toHaveBeenCalled();
+    expect(groupExists).not.toHaveBeenCalled();
+    expect(await proveRunProcessGone(child, "test",
+      probe({ processSpace: oldSpace, macKernelBoot: previous, groups: [4242] })))
+      .toEqual({ verdict: "alive", reason: "process_group_alive" });
   });
 
   it("treats a stamp without a PID or process space as unprovable", async () => {

@@ -33,6 +33,7 @@ import { requestTaskRetry } from "../services/task-retry.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { currentControllerProcessStamp } from "../services/controller-process-identity.js";
+import * as processIdentity from "../services/controller-process-identity.js";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import { createOwnershipReportState, runOwnershipReconciliationPass } from "../services/recovery/ownership-invariant-report.js";
 import fs from "node:fs/promises";
@@ -3392,7 +3393,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs.filter(run => run.retryOfRunId === f.runId)).toHaveLength(1);
   });
 
-  it("schedules one conversation continuation after losing the provider", async () => {
+  it.each(["missing PID", "macOS reboot"])("schedules one conversation continuation after losing the provider (%s)", async loss => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: 999_999_999,
@@ -3405,7 +3406,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     const heartbeat = heartbeatService(db);
 
-    const result = await heartbeat.reapOrphanedRuns();
+    let restoreProbe: (() => void) | undefined;
+    if (loss === "macOS reboot") {
+      const priorSpace = "a".repeat(32);
+      const previousBoot = { hardwareHash: "a".repeat(64), sessionHash: "1".repeat(64) };
+      await db.update(heartbeatRuns).set({
+        processHostHash: priorSpace,
+        controllerProcess: {
+          bootId: "previous-controller", pid: 123, hostHash: priorSpace, macKernelBoot: previousBoot,
+        },
+        processGroupId: 999_999_999,
+      }).where(eq(heartbeatRuns.id, runId));
+      const rebootProbe = vi.spyOn(processIdentity, "currentMacKernelBoot")
+        .mockReturnValue({ ...previousBoot, sessionHash: "2".repeat(64) });
+      restoreProbe = () => rebootProbe.mockRestore();
+    }
+    const result = await heartbeat.reapOrphanedRuns().finally(restoreProbe);
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
 
@@ -3425,7 +3441,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       timeoutConfigured: false,
       timeoutFired: false,
       processLossDiagnostic: {
-        pidRecorded: true, groupRecorded: false, localCheck: "not_observed_alive", retryEligible: true,
+        pidRecorded: true, groupRecorded: loss === "macOS reboot", localCheck: "not_observed_alive", retryEligible: true,
         observerUptimeMs: expect.any(Number), runPredatesObserver: true,
       },
     });
@@ -3438,7 +3454,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         errorCode: "process_lost",
         runStatus: "failed",
         diagnostics: expect.objectContaining({ execution: expect.objectContaining({
-          processLossPidRecorded: true, processLossGroupRecorded: false, processLossLocalCheck: "not_observed_alive",
+          processLossPidRecorded: true, processLossGroupRecorded: loss === "macOS reboot", processLossLocalCheck: "not_observed_alive",
           processLossRetryEligible: true, processLossRunPredatesObserver: true,
         }) }),
       }),

@@ -299,7 +299,7 @@ function nrfTokenLeaseOwner(row: NrfRow, scope: NativeTokenLeaseKind): RecordOwn
 
 type RunRow = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "issueId" | "status" | "controllerBootId"
   | "controllerLeaseExpiresAt" | "processPid" | "processGroupId" | "processStartedAt" | "processHostHash" | "updatedAt"
-  | "runnerProfileJson" | "controllerProcess">;
+  | "runnerProfileJson" | "controllerProcess" | "runtimeMode">;
 
 const runColumns = {
   id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, issueId: heartbeatRuns.issueId, status: heartbeatRuns.status,
@@ -308,7 +308,7 @@ const runColumns = {
   processStartedAt: heartbeatRuns.processStartedAt, processHostHash: heartbeatRuns.processHostHash,
   updatedAt: heartbeatRuns.updatedAt,
   runnerProfileJson: heartbeatRuns.runnerProfileJson,
-  controllerProcess: heartbeatRuns.controllerProcess,
+  controllerProcess: heartbeatRuns.controllerProcess, runtimeMode: heartbeatRuns.runtimeMode,
 };
 
 function runKind(id: string, title: string, obligation: Obligation, where: SQL | undefined,

@@ -10,6 +10,13 @@ vi.mock("./hot-restart.js", () => ({ readProcessStartedAt: state.selfBirth }));
 const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
 const firstBoot = "00000000-0000-4000-8000-000000000001";
 const secondBoot = "00000000-0000-4000-8000-000000000002";
+const hardware = "00000000-0000-4000-8000-000000000003";
+function mockMacKernel(session: string, virtual = false) {
+  state.sysctl.mockImplementation((command: string, args: string[]) => {
+    if (command === "/usr/sbin/ioreg") return `"IOPlatformUUID" = "${hardware}"`;
+    return args[1] === "kern.hv_vmm_present" ? (virtual ? "1" : "0") : session.toUpperCase() + "\n";
+  });
+}
 function platform(value: string) { Object.defineProperty(process, "platform", { ...descriptor, value }); }
 async function fresh() { vi.resetModules(); return import("./controller-process-identity.js"); }
 
@@ -35,25 +42,42 @@ describe("controller process-space identity", () => {
     expect((await (await fresh()).currentControllerProcess()).hostHash).not.toBe(original.hostHash);
   });
 
-  it("uses Darwin kernel boot UUID once per module, never a rounded clock identity", async () => {
+  it("uses bounded Darwin kernel reads once per module and stores no raw IDs", async () => {
     platform("darwin");
+    mockMacKernel(firstBoot);
     const owner = await fresh();
     const first = await owner.currentControllerProcess();
     expect(first.hostHash).toMatch(/^[0-9a-f]{32}$/);
-    expect(state.sysctl).toHaveBeenCalledExactlyOnceWith("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"],
+    expect(state.sysctl).toHaveBeenCalledWith("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"],
       { encoding: "utf8", timeout: 1_500, maxBuffer: 4_096, windowsHide: true });
+    expect(first.macKernelBoot).toEqual({ hardwareHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      sessionHash: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(owner.readControllerProcess(first)).toEqual(first);
     expect(state.read).not.toHaveBeenCalled(); expect(state.link).not.toHaveBeenCalled();
-    state.sysctl.mockReturnValue(secondBoot);
+    mockMacKernel(secondBoot);
     expect((await owner.currentControllerProcess()).hostHash).toBe(first.hostHash);
-    expect(state.sysctl).toHaveBeenCalledTimes(1);
-    expect((await (await fresh()).currentControllerProcess()).hostHash).not.toBe(first.hostHash);
-    expect(state.sysctl).toHaveBeenCalledTimes(2);
+    expect(state.sysctl).toHaveBeenCalledTimes(3);
+    const second = await (await fresh()).currentControllerProcess();
+    expect(second.hostHash).not.toBe(first.hostHash);
+    expect(second.macKernelBoot?.hardwareHash).toBe(first.macKernelBoot?.hardwareHash);
+    expect(second.macKernelBoot?.sessionHash).not.toBe(first.macKernelBoot?.sessionHash);
+    expect(state.sysctl).toHaveBeenCalledTimes(6);
     expect(JSON.stringify(first)).not.toContain(firstBoot);
+    expect(JSON.stringify(first)).not.toContain(hardware);
     // Old weak/foreign receipts retain their original deadline: no local probe.
     const kill = vi.spyOn(process, "kill");
     expect(await owner.controllerProcessExited({ bootId: "old", pid: 2_000_000_001,
       hostHash: "old-rounded-clock-hash", processStartedAt: null })).toBe(false);
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("does not stamp physical Mac reboot evidence in a virtual machine", async () => {
+    platform("darwin");
+    mockMacKernel(firstBoot, true);
+    const identity = await (await fresh()).currentControllerProcess();
+    expect(identity.hostHash).toMatch(/^[0-9a-f]{32}$/);
+    expect(identity.macKernelBoot).toBeUndefined();
+    expect(state.sysctl).toHaveBeenCalledTimes(2);
   });
 
   it.each(["unreadable", "malformed", "unsupported"] as const)("fails closed without an owner PID probe for %s identity", async mode => {

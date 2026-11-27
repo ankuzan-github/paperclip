@@ -801,7 +801,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // unprovable one is never released, so it stays adopted and the
       // active-execution reaper keeps holding it (Stop is its operator action).
       const processProof = await proveRunProcessGone({ processPid, processGroupId,
-        processStartedAt: run.processStartedAt, processHostHash: run.processHostHash }, "hot_restart_adoption_marker");
+        processStartedAt: run.processStartedAt, processHostHash: run.processHostHash,
+        controllerProcess: run.processPid || run.processGroupId ? run.controllerProcess : null,
+        runtimeMode: run.runtimeMode }, "hot_restart_adoption_marker");
       if (!processProof || processProof.verdict === "gone") {
         classify(candidate, "lost", "process_not_alive", patch);
         continue;

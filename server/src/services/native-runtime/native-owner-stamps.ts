@@ -1,5 +1,6 @@
 import type { heartbeatRuns, nativeRunFinalizations } from "@paperclipai/db";
 import type { LocalOwnerStamp } from "../owner-proof.js";
+import { readControllerProcess } from "../controller-process-identity.js";
 
 /**
  * Owner stamps for the native records that `proveOwnerGone` judges (plan
@@ -28,6 +29,8 @@ export function nativeControllerOwnerStamp(row: ControllerRow, scope: string): L
 
 type RunProcessRow = Pick<typeof heartbeatRuns.$inferSelect, "processPid" | "processGroupId" | "processStartedAt"> & {
   processHostHash?: string | null;
+  controllerProcess?: typeof heartbeatRuns.$inferSelect.controllerProcess;
+  runtimeMode?: typeof heartbeatRuns.$inferSelect.runtimeMode;
 };
 
 /** heartbeat_runs records the adapter child's PID, group, start time and,
@@ -37,8 +40,14 @@ type RunProcessRow = Pick<typeof heartbeatRuns.$inferSelect, "processPid" | "pro
  * is unprovable. */
 export function runProcessOwnerStamp(row: RunProcessRow, scope: string,
   options: { legacyFallback?: boolean } = {}): LocalOwnerStamp {
+  const controller = row.runtimeMode === "legacy" ? readControllerProcess(row.controllerProcess) : null;
+  // The legacy claim records the launching controller. Bind its boot evidence
+  // to this child only when both were stamped in the same local PID space.
+  const macKernelBoot = controller && controller.hostHash === row.processHostHash
+    && /^[0-9a-f]{32}$/.test(controller.hostHash) ? controller.macKernelBoot : undefined;
   return {
     kind: "local", scope, generation: null, host: null, processSpace: row.processHostHash ?? null,
+    ...(macKernelBoot ? { macKernelBoot } : {}),
     ...(options.legacyFallback ? { processSpaceUnrecorded: row.processHostHash == null } : {}),
     bootId: null, pid: row.processPid, processStartedAt: row.processStartedAt?.toISOString() ?? null,
     processGroupId: row.processGroupId,
