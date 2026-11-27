@@ -42,6 +42,7 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASONS = new Set([
   "execution_review_requested",
   "execution_approval_requested",
   "execution_delivery_requested",
+  "issue_execution_policy_restored",
 ]);
 const HEARTBEAT_RUN_TERMINAL_STATUSES = new Set([
   "succeeded",

@@ -276,6 +276,10 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
         .orderBy(issueExecutionDecisions.createdAt);
       expect(decisions.slice(0, 2)).toEqual(f.decisionRows);
       expect(decisions[2]).toMatchObject({ stageId: f.policy.stages[2].id, outcome: "approved", actorAgentId: f.qa });
+      const qaRunsAfterVerdict = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.issueId, f.issueId), eq(heartbeatRuns.agentId, f.qa),
+      ));
+      expect(qaRunsAfterVerdict).toEqual([{ id: qaRunId }]);
       expect((await f.apply(preview.body.expectedVersion).expect(200)).body).toEqual(applied.body);
       expect(await audits(f.issueId)).toHaveLength(1);
       const restorationWakes = (await wakes(f.issueId)).filter(wake => wake.idempotencyKey?.includes(f.activityId));
@@ -283,6 +287,38 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     },
     30_000,
   );
+
+  it("continues restored QA once when the run succeeds without a stage decision", async () => {
+    const f = await seed("LEA-1901");
+    const { body: { expectedVersion } } = await f.preview().expect(200);
+    const { body: applied } = await f.apply(expectedVersion).expect(200);
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId, requestId: applied.wakeupRequestId });
+    await heartbeat.drainActiveRunExecutions();
+
+    const qaRuns = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.issueId, f.issueId), eq(heartbeatRuns.agentId, f.qa),
+    ));
+    expect(qaRuns).toHaveLength(2);
+    const restored = qaRuns.find(run => run.wakeupRequestId === applied.auditActivityId);
+    expect(restored).toMatchObject({ status: "succeeded", contextSnapshot: {
+      wakeReason: "issue_execution_policy_restored", restorationActivityId: applied.auditActivityId,
+    } });
+    const retry = qaRuns.find(run => run.id !== restored?.id);
+    expect(retry).toMatchObject({ retryOfRunId: restored?.id, contextSnapshot: {
+      wakeReason: "execution_review_participant_recovery", retryReason: "execution_review_participant_recovery",
+      currentStageId: f.policy.stages[2].id,
+    } });
+    expect(invokeAdapter.mock.calls.map(([context]) => context.runId)).toEqual([restored?.id, retry?.id]);
+    expect((await wakes(f.issueId)).filter(wake => wake.reason === "execution_review_participant_recovery"))
+      .toEqual([expect.objectContaining({ agentId: f.qa, runId: retry?.id })]);
+    expect(await readIssue(f.issueId)).toMatchObject({ assigneeAgentId: f.qa, executionState: {
+      status: "pending", currentStageId: f.policy.stages[2].id,
+      currentParticipant: { type: "agent", agentId: f.qa },
+    } });
+    expect(await audits(f.issueId)).toEqual([expect.objectContaining({ id: applied.auditActivityId })]);
+  }, 30_000);
 
   it("requires Board and current company/task mutation access on preview and apply", async () => {
     vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
@@ -448,20 +484,21 @@ describe.skipIf(!support.supported)("Board restoration of a lost execution route
     try {
       await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups(dispatch),
         restarted.dispatchPendingNativeStatusWakeups(dispatch)]);
-      await vi.waitFor(() => expect(invokeAdapter).toHaveBeenCalledOnce(), { timeout: 10_000 });
     } finally {
       await Promise.all([heartbeat.drainActiveRunExecutions(), restarted.drainActiveRunExecutions()]);
     }
     expect((await f.apply(expectedVersion).expect(200)).body).toEqual(applied);
     expect(await restarted.dispatchPendingNativeStatusWakeups(dispatch)).toEqual({ scanned: 0, dispatched: 0, recovered: 0, deferred: 0 });
-    expect(invokeAdapter).toHaveBeenCalledOnce();
-    const runs = await readRuns();
-    expect(runs).toEqual([expect.objectContaining({ agentId: f.qa, wakeupRequestId: applied.auditActivityId })]);
-    expect(await wakes(f.issueId)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: dispatch.requestId, status: "coalesced", runId: runs[0].id }),
-      expect.objectContaining({ id: applied.auditActivityId, runId: runs[0].id }),
+    const restoredRuns = (await readRuns()).filter(run => run.contextSnapshot?.wakeReason === "issue_execution_policy_restored");
+    expect(restoredRuns).toEqual([expect.objectContaining({ agentId: f.qa, wakeupRequestId: applied.auditActivityId })]);
+    const [restoredRun] = restoredRuns;
+    expect(invokeAdapter.mock.calls.filter(([context]) => context.runId === restoredRun.id)).toHaveLength(1);
+    const restorationWakes = (await wakes(f.issueId)).filter(wake => wake.reason === "issue_execution_policy_restored");
+    expect(restorationWakes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: dispatch.requestId, status: "coalesced", runId: restoredRun.id }),
+      expect.objectContaining({ id: applied.auditActivityId, runId: restoredRun.id }),
     ]));
-    expect(await wakes(f.issueId)).toHaveLength(2);
+    expect(restorationWakes).toHaveLength(2);
     expect(await audits(f.issueId)).toHaveLength(1);
   }, 30_000);
 
