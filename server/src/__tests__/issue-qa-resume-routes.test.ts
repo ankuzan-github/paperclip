@@ -139,10 +139,16 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       resolvedByAgentId: ceo, createdAt: new Date("2026-11-27T03:03:00Z"), resolvedAt: new Date("2026-11-27T03:05:00Z"),
       payload: {
         version: 1,
-        questions: [{
-          id: "restore_route", prompt: "Resume QA?", selectionMode: "single", allowOther: true,
-          options: [{ id: "paperclip_text_answer", label: "Type an answer", freeText: true }],
-        }],
+        questions: [
+          {
+            id: "restore_route", prompt: "Resume QA?", selectionMode: "single", allowOther: true,
+            options: [{ id: "paperclip_text_answer", label: "Type an answer", freeText: true }],
+          },
+          {
+            id: "quote_for_context", prompt: "Quote for context", selectionMode: "single", allowOther: true,
+            options: [{ id: "paperclip_text_answer", label: "Type an answer", freeText: true }],
+          },
+        ],
       },
       result: answer(historical ? "Возобновить сохранённую QA" : `${marker}\nContinue the saved QA.`),
     });
@@ -160,7 +166,7 @@ describePostgres("resume saved Cards QA via HTTP", () => {
       wakes: await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-      )),
+      )).orderBy(agentWakeupRequests.id),
     });
     const authorization = (ownerRun: string = runId) => `Bearer ${createLocalAgentJwt(implementer, companyId, "process", ownerRun)}`;
     const path = `/api/issues/${identifier}/resume-execution-stage`;
@@ -276,6 +282,17 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     const f = await fixture();
     const [other] = await db.insert(issues).values({ companyId, title: "Unrelated task" }).returning();
     await db.update(issueThreadInteractions).set({ issueId: other!.id }).where(eq(issueThreadInteractions.id, f.body.ceoInteractionId));
+    await expectRejection(f, 403, f.body, "issue_qa_resume_ceo_response_required");
+  });
+
+  it("respects the CEO's denial when another answer quotes the approval marker", async () => {
+    const f = await fixture();
+    const denial = f.answer("QA resume denied");
+    denial.answers.push({
+      questionId: "quote_for_context", optionIds: ["paperclip_text_answer"], otherText: f.marker,
+    });
+    await db.update(issueThreadInteractions).set({ result: denial })
+      .where(eq(issueThreadInteractions.id, f.body.ceoInteractionId));
     await expectRejection(f, 403, f.body, "issue_qa_resume_ceo_response_required");
   });
 
