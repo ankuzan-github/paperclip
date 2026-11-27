@@ -1019,6 +1019,15 @@ const issueCommentAttachmentIdsSchema = z
     message: "Attachment ids must be unique",
   });
 
+export const resumeIssueExecutionStageSchema = z.strictObject({
+  stageId: z.string().uuid(),
+  returnDecisionId: z.string().uuid(),
+  ceoInteractionId: z.string().uuid(),
+  statusVersion: z.number().int().nonnegative(),
+  updatedAt: z.iso.datetime({ offset: true }),
+  comment: multilineTextSchema.pipe(z.string().trim().min(1)),
+});
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     workspaceSelection: true,

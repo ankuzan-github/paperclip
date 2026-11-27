@@ -13,7 +13,7 @@ export function agentRunWritesRevoked(run: {
 }
 
 /** The caller must supply its write transaction, so Stop and commit serialize. */
-export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, actor: {
+export async function assertAgentRunWriteAllowed(tx: Pick<Db, "select">, companyId: string, actor: {
   agentId?: string | null;
   runId?: string | null;
   stopId?: string | null;
@@ -21,6 +21,7 @@ export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, acto
   if (!actor.agentId || !actor.runId) return;
   const [run] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
     runtimeMode: heartbeatRuns.runtimeMode, companyId: heartbeatRuns.companyId,
+    issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
     contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)))

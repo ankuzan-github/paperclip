@@ -23,6 +23,7 @@ import { listIssueSummaries } from "../services/issue-summaries.js";
 import { listIssueStatusBlockerAttention } from "../services/issue-status-presentation.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
+import { issueQaResumeSnapshotChanged, prepareIssueQaResume, type ResumeIssueExecutionStage } from "../services/issue-qa-resume.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { markIssueReadSchema } from "@paperclipai/shared";
@@ -156,6 +157,7 @@ import {
   updateIssueWorkProductSchema,
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
+  resumeIssueExecutionStageSchema,
   updateIssueSchema,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
@@ -14750,6 +14752,121 @@ export function issueRoutes(
     }
     return lock;
   }
+
+  router.patch(
+    "/issues/:id/resume-execution-stage",
+    validateIssueMutationBody(resumeIssueExecutionStageSchema),
+    async (req, res) => {
+      if (req.actor.type !== "agent" || req.actor.source !== "agent_jwt" || !req.actor.agentId || !req.actor.runId) {
+        throw forbidden("Resuming QA requires an authenticated task run");
+      }
+      const actor = { agentId: req.actor.agentId, runId: req.actor.runId };
+      const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!existing || !(await assertIssueReadAllowed(req, res, existing))) return;
+      const accessDecision = await decideIssueAccess(req, existing, "issue:mutate");
+      if (!accessDecision.allowed) {
+        await denyIssueWrite(req, res, existing, issueWriteDenialCodeForDecision(accessDecision));
+        return;
+      }
+
+      const request: ResumeIssueExecutionStage = req.body;
+      const publications: ActivityPublication[] = [];
+      const { issue, previousState, commentId } = await db.transaction(async (tx) => {
+        const locked = await svc.getByIdForUpdate(existing.id, tx);
+        if (!locked || locked.companyId !== existing.companyId) throw notFound("Issue not found");
+        const patch = await prepareIssueQaResume(tx, locked, request, actor);
+
+        // Hold the blocker sources through the commit. A busy source must be
+        // re-read instead of proceeding on a status that may be rolled back.
+        const readiness = await svc.getDependencyReadiness(locked.id, tx, { lockSources: true }).catch((error: unknown) => {
+          if (parseObject(error).code === "55P03" || parseObject(parseObject(error).cause).code === "55P03") {
+            throw issueQaResumeSnapshotChanged();
+          }
+          throw error;
+        });
+        if (!readiness.isDependencyReady) {
+          throw conflict("Issue is blocked by unresolved blockers", {
+            code: "issue_qa_resume_unresolved_blockers",
+            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+          });
+        }
+
+        const responsibleUserId = authenticatedActorResponsibleUserId(req);
+        const authorizationReason = issueWriteAuthorizationReason(req, accessDecision);
+        const comment = await svc.addComment(locked.id, request.comment, {
+          ...actor,
+          onBehalfOfUserId: responsibleUserId,
+        }, { authorizationReason }, tx);
+        await issueReferencesSvc.syncComment(comment.id, tx);
+        const updated = await svc.update(locked.id, {
+          ...patch,
+          companyGuard: locked.companyId,
+          actorAgentId: actor.agentId,
+          actorRunId: actor.runId,
+        }, tx, publications);
+        if (!updated) throw issueQaResumeSnapshotChanged();
+        const activity = {
+          ...actor,
+          companyId: locked.companyId,
+          actorType: "agent" as const,
+          actorId: actor.agentId,
+          responsibleUserIdOverride: responsibleUserId,
+          entityType: "issue",
+          entityId: locked.id,
+        };
+        await logActivity(tx as unknown as Db, {
+          ...activity,
+          action: "issue.updated",
+          details: {
+            identifier: locked.identifier,
+            changes: updated.changes,
+            stageId: request.stageId,
+            returnDecisionId: request.returnDecisionId,
+            ceoInteractionId: request.ceoInteractionId,
+            commentId: comment.id,
+            source: "resume_execution_stage",
+          },
+        }, publications);
+        await logActivity(tx as unknown as Db, {
+          ...activity,
+          action: "issue.comment_added",
+          details: {
+            commentId: comment.id,
+            bodySnippet: comment.body.slice(0, 120),
+            identifier: locked.identifier,
+            issueTitle: locked.title,
+            authorizationReason,
+          },
+        }, publications);
+        return {
+          issue: updated,
+          previousState: parseIssueExecutionState(locked.executionState),
+          commentId: comment.id,
+        };
+      });
+      for (const publication of publications) publishActivity(publication);
+
+      const wake = buildExecutionStageWakeup({
+        issueId: issue.id,
+        previousState,
+        nextState: parseIssueExecutionState(issue.executionState),
+        interruptedRunId: null,
+        requestedByActorType: "agent",
+        requestedByActorId: actor.agentId,
+      });
+      if (wake) {
+        // The queue can recover a deferred wake after a restart when it carries
+        // the saved comment. Keep the wake reason and stage context for QA.
+        await heartbeat.wakeup(wake.agentId, {
+          ...wake.wakeup,
+          payload: { ...wake.wakeup.payload, commentId },
+        }).catch((err) => {
+          logger.error({ err, issueId: issue.id, stageId: request.stageId }, "failed to wake resumed execution stage");
+        });
+      }
+      res.json(issue);
+    },
+  );
 
   router.patch(
     "/issues/:id",

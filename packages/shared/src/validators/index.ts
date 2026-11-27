@@ -439,6 +439,7 @@ export {
   issueBlockedInboxSeveritySchema,
   issueBlockedInboxStateSchema,
   updateIssueSchema,
+  resumeIssueExecutionStageSchema,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   requiredQualityReviewSchema,

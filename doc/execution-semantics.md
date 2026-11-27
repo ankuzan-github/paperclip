@@ -91,6 +91,22 @@ promote the stopped agent's own queued work, but it does promote the current
 assignee's waiting wake. A run that finished on its own before the Stop needs no
 stop. The request refuses the reassignment only when no Stop was recorded.
 
+### Resuming a saved Cards QA return
+
+The Cards fork exposes `PATCH /api/issues/:id/resume-execution-stage` to an
+assignee's authenticated task run. It requires `stageId`, `returnDecisionId`,
+`ceoInteractionId`, `statusVersion`, `updatedAt`, and `comment`. The write
+transaction checks the saved QA stage and return, task snapshot, dependency
+readiness, and the CEO's answered interaction on that task. The answer starts
+with `pc-resume-qa: LEA-<n> return=<decision-id>`. The LEA-1880 decision predates
+this format and is accepted by its specific return and interaction IDs.
+A stale snapshot produces HTTP 409.
+
+The response is the issue in `in_review` with its saved QA stage pending and
+its QA participant assigned. The policy and decision history are preserved.
+The normal execution-stage wakeup follows the commit. The Cards client verifies
+the reviewed and delivered Git package before calling this endpoint.
+
 ## 3. Status Semantics
 
 Paperclip issue statuses are not just UI labels. They imply different expectations about ownership and execution.
