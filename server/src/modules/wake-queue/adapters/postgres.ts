@@ -1336,7 +1336,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // agent's review participation retains its separate recovery path.
         const reviewState = issueRow.status === "in_review" ? parseIssueExecutionState(issueRow.executionState) : null;
         const hasSavedQaWake = reviewState?.status === "pending" && reviewState.currentStageType === "review" &&
-          reviewState.lastDecisionOutcome === "changes_requested" && issueRow.assigneeAgentId
+          reviewState.lastDecisionOutcome === "changes_requested" && reviewState.currentStageId &&
+          reviewState.lastDecisionId && issueRow.assigneeAgentId
           ? exists(tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
             eq(agentWakeupRequests.companyId, input.companyId),
             eq(agentWakeupRequests.agentId, issueRow.assigneeAgentId),

@@ -4030,19 +4030,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           const reviewState = parseObject(issue.executionState);
+          const stageId = readNonEmptyString(reviewState.currentStageId);
+          const returnDecisionId = readNonEmptyString(reviewState.lastDecisionId);
           // The saved review wake owns the next turn even between the source
           // run's completion and promotion of the deferred wake.
           const [savedQaWake] = issue.status === "in_review" && issue.assigneeAgentId === agentId &&
             reviewState.status === "pending" && reviewState.currentStageType === "review" &&
-            reviewState.lastDecisionOutcome === "changes_requested"
+            reviewState.lastDecisionOutcome === "changes_requested" && stageId && returnDecisionId
             ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
                 eq(agentWakeupRequests.companyId, issue.companyId),
                 eq(agentWakeupRequests.agentId, agentId),
                 eq(agentWakeupRequests.status, "deferred_issue_execution"),
                 executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined,
                 sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-                sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' = ${reviewState.lastDecisionId}`,
-                sql`${agentWakeupRequests.payload} #>> '{executionStage,stageId}' = ${reviewState.currentStageId}`,
+                sql`${agentWakeupRequests.payload}->>'qaResumeReturnDecisionId' = ${returnDecisionId}`,
+                sql`${agentWakeupRequests.payload} #>> '{executionStage,stageId}' = ${stageId}`,
               )).limit(1)
             : [];
 
