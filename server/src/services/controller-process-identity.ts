@@ -11,8 +11,10 @@ import { currentWorkspaceWorker, type WorkspaceWorker } from "./native-runtime/n
  * starter has exited, so the side effect cannot still be in flight there.
  */
 export type ControllerDeployment = { worker: WorkspaceWorker; exclusiveVolume: boolean; volumeId: string | null };
+export type MacKernelBoot = { hardwareHash: string; sessionHash: string };
 export type ControllerProcess = {
   bootId: string; pid: number; hostHash: string; processStartedAt: string | null; deployment?: ControllerDeployment;
+  macKernelBoot?: MacKernelBoot;
 };
 
 export function currentControllerDeployment(env: NodeJS.ProcessEnv = process.env): ControllerDeployment | null {
@@ -52,6 +54,56 @@ function readDeployment(value: unknown): ControllerDeployment | null {
 const bootId = randomUUID();
 export const UNKNOWN_PROCESS_SPACE = "unknown";
 
+const kernelUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const kernelCommandOptions = { encoding: "utf8", timeout: 1_500, maxBuffer: 4_096, windowsHide: true } as const;
+
+function sysctl(name: string): string {
+  return execFileSync("/usr/sbin/sysctl", ["-n", name], kernelCommandOptions).trim().toLowerCase();
+}
+
+function readMacBootSession(): string | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const sessionId = sysctl("kern.bootsessionuuid");
+    return kernelUuid.test(sessionId) ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+const macBootSession = readMacBootSession();
+
+function readMacKernelBoot(): MacKernelBoot | undefined {
+  if (!macBootSession) return undefined;
+  try {
+    // A cloned VM can inherit the hardware UUID while its original is running.
+    if (sysctl("kern.hv_vmm_present") !== "0") return undefined;
+    const platform = execFileSync("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"],
+      { ...kernelCommandOptions, maxBuffer: 16_384 });
+    const uuid = platform.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/)?.[1]?.toLowerCase();
+    if (!uuid || !kernelUuid.test(uuid) || uuid === "00000000-0000-0000-0000-000000000000") return undefined;
+    const hardwareHash = createHash("sha256").update("paperclip.mac-hardware\0").update(uuid).digest("hex");
+    const sessionHash = createHash("sha256").update("paperclip.mac-kernel-session\0").update(macBootSession).digest("hex");
+    return { hardwareHash, sessionHash };
+  } catch {
+    return undefined;
+  }
+}
+
+const macKernelBoot = readMacKernelBoot();
+
+export function currentMacKernelBoot(): MacKernelBoot | undefined {
+  return macKernelBoot;
+}
+
+function readRecordedMacKernelBoot(value: unknown): MacKernelBoot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { hardwareHash, sessionHash } = value as Partial<MacKernelBoot>;
+  if (typeof hardwareHash !== "string" || !/^[0-9a-f]{64}$/.test(hardwareHash)
+    || typeof sessionHash !== "string" || !/^[0-9a-f]{64}$/.test(sessionHash)) return undefined;
+  return { hardwareHash, sessionHash };
+}
+
 /**
  * Names the space in which PIDs are comparable: one kernel boot and, on Linux,
  * one PID namespace. Containers that share a hostname but not a PID namespace
@@ -65,14 +117,8 @@ function processSpaceHash(): string {
     if (process.platform === "linux") {
       parts.push(readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), readlinkSync("/proc/self/ns/pid"));
     } else if (process.platform === "darwin") {
-      // One bounded, read-only kernel identity observation per module. Rounded
-      // boot-time estimates can collide across hosts and cannot authorize PID
-      // comparisons. Old weak hashes simply stop matching this stronger proof.
-      const bootSession = execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
-        encoding: "utf8", timeout: 1_500, maxBuffer: 4_096, windowsHide: true,
-      }).trim().toLowerCase();
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootSession)) return UNKNOWN_PROCESS_SPACE;
-      parts.push(bootSession);
+      if (!macBootSession) return UNKNOWN_PROCESS_SPACE;
+      parts.push(macBootSession);
     } else {
       return UNKNOWN_PROCESS_SPACE;
     }
@@ -144,7 +190,8 @@ export async function currentControllerProcess(): Promise<ControllerProcess> {
   const iso = startedAt === null ? null : new Date(startedAt).toISOString();
   resolvedProcessStartedAt = iso;
   notifyStamp();
-  return { bootId, pid: process.pid, hostHash, processStartedAt: iso, ...deploymentField() };
+  return { bootId, pid: process.pid, hostHash, processStartedAt: iso,
+    ...(macKernelBoot ? { macKernelBoot } : {}), ...deploymentField() };
 }
 
 /**
@@ -155,7 +202,8 @@ export async function currentControllerProcess(): Promise<ControllerProcess> {
  */
 export function currentControllerProcessStamp(): ControllerProcess {
   notifyStamp();
-  return { bootId, pid: process.pid, hostHash, processStartedAt: resolvedProcessStartedAt, ...deploymentField() };
+  return { bootId, pid: process.pid, hostHash, processStartedAt: resolvedProcessStartedAt,
+    ...(macKernelBoot ? { macKernelBoot } : {}), ...deploymentField() };
 }
 
 export function readControllerProcess(value: unknown): ControllerProcess | null {
@@ -164,8 +212,10 @@ export function readControllerProcess(value: unknown): ControllerProcess | null 
   if (typeof record.bootId !== "string" || typeof record.hostHash !== "string" ||
       typeof record.pid !== "number" || !Number.isInteger(record.pid) || record.pid <= 0) return null;
   const deployment = readDeployment(record.deployment);
+  const recordedMacBoot = readRecordedMacKernelBoot(record.macKernelBoot);
   return { bootId: record.bootId, pid: record.pid, hostHash: record.hostHash,
     processStartedAt: typeof record.processStartedAt === "string" ? record.processStartedAt : null,
+    ...(recordedMacBoot ? { macKernelBoot: recordedMacBoot } : {}),
     ...(deployment ? { deployment } : {}) };
 }
 

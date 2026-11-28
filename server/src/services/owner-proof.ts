@@ -1,6 +1,7 @@
 import { hostname } from "node:os";
 import {
   currentControllerBootId,
+  currentMacKernelBoot,
   currentControllerDeployment,
   currentControllerProcessStamp,
   currentProcessSpaceHash,
@@ -9,6 +10,7 @@ import {
   processStartsDefinitelyDiffer,
   PROCESS_START_PRECISION_MS,
   UNKNOWN_PROCESS_SPACE,
+  type MacKernelBoot,
 } from "./controller-process-identity.js";
 import type { WorkspaceWorker } from "./native-runtime/native-workspace-platform-proof.js";
 import { ephemeralServerEnabled } from "./ephemeral-server-mode.js";
@@ -38,6 +40,8 @@ export type LocalOwnerStamp = {
   host: string | null;
   /** Hash of host, kernel boot and PID namespace (`currentProcessSpaceHash`). */
   processSpace: string | null;
+  /** Kernel boot of the physical Mac that started the local owner. */
+  macKernelBoot?: MacKernelBoot;
   bootId: string | null;
   pid: number | null;
   processStartedAt: string | null;
@@ -93,6 +97,7 @@ export type OwnerProofReason =
   | "generation_superseded"
   | "provider_stopped"
   | "deployment_replaced"
+  | "mac_rebooted"
   | "operator_attested"
   /** The owner's server boot stopped cleanly, or a newer boot fenced it after its lease expired. */
   | "controller_stopped"
@@ -138,6 +143,7 @@ export type ProcessProbe = {
   bootId: string;
   host: string;
   processSpace: string;
+  macKernelBoot?: MacKernelBoot;
   pidExists(pid: number): boolean;
   processGroupExists(processGroupId: number): boolean;
   readStartedAt(pid: number): Promise<Date | null>;
@@ -175,6 +181,7 @@ export function currentProcessProbe(): ProcessProbe {
     bootId: currentControllerBootId(),
     host: hostname(),
     processSpace: currentProcessSpaceHash(),
+    macKernelBoot: currentMacKernelBoot(),
     pidExists: processExists,
     processGroupExists,
     controllerInstance: async function (this: ProcessProbe, bootId, touchedAt) {
@@ -217,7 +224,8 @@ const validPid = (pid: number | null | undefined): pid is number =>
  * Local rules (one prover for every kind):
  * - this process's boot id is alive;
  * - the stamp must name this PID space (host, kernel boot, PID namespace); a
- *   different host or namespace is never proof;
+ *   different host or namespace is never proof. Two kernel sessions of the
+ *   same physical Mac prove exit independently of current PIDs;
  * - the PID must be dead, or reused: a live PID that started at least 1 s
  *   after the stamp (`ps lstart` has 1 s precision). An earlier start is
  *   inconsistent and unprovable. EPERM is alive;
@@ -285,7 +293,14 @@ async function proveLocalProcessGone(stamp: LocalOwnerStamp, probe: ProcessProbe
     return { verdict: "unprovable", reason: "unknown_process_space" };
   }
   if (stamp.host && stamp.host !== probe.host) return { verdict: "unprovable", reason: "different_host" };
-  if (stamp.processSpace !== probe.processSpace) return { verdict: "unprovable", reason: "different_process_space" };
+  if (stamp.processSpace !== probe.processSpace) {
+    if (!ephemeralServerEnabled() && stamp.macKernelBoot && probe.macKernelBoot
+      && stamp.macKernelBoot.hardwareHash === probe.macKernelBoot.hardwareHash
+      && stamp.macKernelBoot.sessionHash !== probe.macKernelBoot.sessionHash) {
+      return { verdict: "gone", reason: "mac_rebooted" };
+    }
+    return { verdict: "unprovable", reason: "different_process_space" };
+  }
 
   let processReason: "pid_dead" | "pid_reused";
   if (!probe.pidExists(stamp.pid)) {
