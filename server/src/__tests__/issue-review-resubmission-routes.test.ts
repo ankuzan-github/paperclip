@@ -8,6 +8,8 @@ import {
   createDb, heartbeatRuns, issueComments, issueExecutionDecisions, issueRelations,
   issues, issueThreadInteractions, projects,
 } from "@paperclipai/db";
+import type { resubmitIssueExecutionReviewSchema } from "@paperclipai/shared";
+import type { z } from "zod";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -27,12 +29,15 @@ describePostgres("resubmit a Cards review via HTTP", () => {
   const implementer = randomUUID();
   const reviewer = randomUUID();
   const qa = randomUUID();
+  const designer = "f7094a71-a3c4-421d-877a-e1480058da0f";
   const userId = randomUUID();
   const sha = "395d90eb3a4afc6aee4339cf03df13962ce51354";
   const pattern = {
     review: "^reviewed: [0-9a-f]{40}",
     delivery: "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}",
     qa: "^verified: [0-9a-f]{40}",
+    qaFull: "^verified: [0-9a-f]{40} depth=full$",
+    design: "^design-control: qa/design-control/LEA-\\d+\\.md соответствует",
   };
   const consumed = "issue.review_resubmission_consumed";
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -57,6 +62,8 @@ describePostgres("resubmit a Cards review via HTTP", () => {
       { id: implementer, name: "Fullstack Engineer", role: "engineer" },
       { id: reviewer, name: "Architect", role: "engineer" },
       { id: qa, name: "QA Engineer", role: "qa" },
+      { id: designer, name: "Product Designer", role: "designer" },
+      { id: randomUUID(), name: "Design Probe", role: "designer" },
       { id: ceo, name: "CEO", role: "ceo" },
     ].map((agent) => ({ ...agent, companyId, status: "idle", adapterType: "process" })));
     app = express();
@@ -86,9 +93,11 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     answers: [{ questionId, optionIds: ["paperclip_text_answer"], otherText }],
   });
 
-  async function fixture(historical = false) {
-    const identifier = historical ? "LEA-2049" : `LEA-${++issueNumber}`;
-    const issueId = historical ? "fcc11975-dfac-4d12-8b49-6f90182b3462" : randomUUID();
+  async function fixture(kind: "product" | "product-ui" | "historical" | "lea-2039" = "product") {
+    const historical = kind === "historical";
+    const identifier = historical ? "LEA-2049" : kind === "lea-2039" ? "LEA-2039" : `LEA-${++issueNumber}`;
+    const issueId = historical ? "fcc11975-dfac-4d12-8b49-6f90182b3462" :
+      kind === "lea-2039" ? "f329e062-013a-40e6-843a-91490c8515b8" : randomUUID();
     const returnDecisionId = historical ? "af456ebd-4a00-4a1c-9eb3-2499ca84c79c" : randomUUID();
     const ceoInteractionId: string = historical ? "15bc20b1-b677-494d-ab4a-e4dff86f53fb" : randomUUID();
     const runId = randomUUID();
@@ -99,6 +108,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
         { type: "review" as const, agentId: reviewer, approvalCommentPattern: pattern.review },
         { type: "delivery" as const, agentId: implementer, approvalCommentPattern: pattern.delivery },
         { type: "review" as const, agentId: qa, approvalCommentPattern: pattern.qa },
+        ...(kind === "product-ui" ? [{ type: "review" as const, agentId: designer, approvalCommentPattern: pattern.design }] : []),
       ].map(({ agentId, ...stage }, i) => ({
         ...stage, id: i === 0 ? stageId : randomUUID(), approvalsNeeded: 1 as const,
         participants: [{ id: randomUUID(), ...principal(agentId) }],
@@ -146,11 +156,12 @@ describePostgres("resubmit a Cards review via HTTP", () => {
           options: [{ id: "paperclip_text_answer", label: "Type an answer", freeText: true }],
         })),
       },
-      result: answer(marker),
+      result: answer(kind === "product-ui" ? `${marker} route=product-ui` : marker),
     });
-    const body = {
+    const body: z.input<typeof resubmitIssueExecutionReviewSchema> = {
       stageId, returnDecisionId, ceoInteractionId, reviewedSha: sha, statusVersion: issue!.statusVersion,
       updatedAt: issue!.updatedAt.toISOString(), comment: `submitted: ${sha} branch=pc/${identifier}\nReview the authorized changes.`,
+      ...(kind === "product-ui" ? { route: "product-ui" } : {}),
     };
     const path = `/api/issues/${identifier}/resubmit-execution-review`;
     const authorization = (ownerRun = runId) => `Bearer ${createLocalAgentJwt(implementer, companyId, "process", ownerRun)}`;
@@ -183,8 +194,8 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     return { issueId, identifier, runId, marker, body, path, authorization, call, snapshot, setAnswer, rejectWithoutWrites, executionPolicy };
   }
 
-  it("serializes two submissions and persists the route, evidence, comment, audit and one wake", async () => {
-    const f = await fixture();
+  it.each(["product", "product-ui"] as const)("serializes two %s submissions and saves one receipt, comment and wake", async (route) => {
+    const f = await fixture(route);
     const options = await request(app).options(f.path).expect(200);
     expect(options.headers.allow).toContain("PATCH");
     const before = await f.snapshot();
@@ -193,9 +204,13 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
     const { body: updated } = responses.find((response) => response.status === 200)!;
     const { stages } = updated.executionPolicy;
+    const ui = route === "product-ui";
     expect(stages.map((stage: typeof stages[number]) => [stage.type, stage.participants[0].agentId, stage.approvalCommentPattern]))
-      .toEqual([["review", reviewer, pattern.review], ["delivery", implementer, pattern.delivery], ["review", qa, pattern.qa]]);
-    expect(new Set(stages.map((stage: typeof stages[number]) => stage.id)).size).toBe(3);
+      .toEqual([
+        ["review", reviewer, pattern.review], ["delivery", implementer, pattern.delivery],
+        ["review", qa, ui ? pattern.qaFull : pattern.qa], ...(ui ? [["review", designer, pattern.design]] : []),
+      ]);
+    expect(new Set(stages.map((stage: typeof stages[number]) => stage.id)).size).toBe(ui ? 4 : 3);
     for (const stage of stages) {
       expect(f.executionPolicy.stages.some((previous) => previous.id === stage.id)).toBe(false);
     }
@@ -214,7 +229,7 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     const commentId = saved.comments[0]!.id;
     const evidence = {
       ceoInteractionId: f.body.ceoInteractionId, returnDecisionId: f.body.returnDecisionId,
-      stageId: f.body.stageId, reviewStageId: stages[0].id, reviewedSha: sha, commentId,
+      stageId: f.body.stageId, reviewStageId: stages[0].id, reviewedSha: sha, commentId, route,
     };
     expect(saved.audit).toHaveLength(3);
     expect(saved.audit).toEqual(expect.arrayContaining([
@@ -257,10 +272,12 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     });
   });
 
-  it.each(["missing", "superseded"])("binds the legacy approval request to its stage when the submission comment is %s", async (commentState) => {
-    const f = await fixture();
+  it.each([
+    ["missing", "product"], ["superseded", "product"], ["missing", "product-ui"],
+  ] as const)("binds approval to its stage with a %s submission comment on %s", async (commentState, route) => {
+    const f = await fixture(route);
     const { body: started } = await f.call().expect(200);
-    const [review, delivery, verification] = started.executionPolicy.stages;
+    const [review, delivery, verification, control] = started.executionPolicy.stages;
     const otherSha = "a".repeat(40);
     const issuePath = `/api/issues/${f.identifier}`;
     const stageRun = async (agentId: string) => {
@@ -316,10 +333,61 @@ describePostgres("resubmit a Cards review via HTTP", () => {
       status: "in_review", assigneeAgentId: qa,
       executionState: { currentStageId: verification.id, completedStageIds: [review.id, delivery.id] },
     });
+    if (route === "product-ui") {
+      const qaHeaders = await stageRun(qa);
+      const beforeQa = await f.snapshot();
+      const deliveredSha = "b".repeat(40);
+      const qaRejected = await approve(`verified: ${deliveredSha} depth=light`, qaHeaders).expect(422);
+      expect(qaRejected.body.details?.code).toBe("approval_comment_pattern_mismatch");
+      expect((await f.snapshot()).decisions).toEqual(beforeQa.decisions);
+      const { body: verified } = await approve(`verified: ${deliveredSha} depth=full`, qaHeaders).expect(200);
+      expect(verified).toMatchObject({
+        status: "in_review", assigneeAgentId: designer,
+        executionState: { currentStageId: control.id, completedStageIds: [review.id, delivery.id, verification.id] },
+      });
+      const designHeaders = await stageRun(designer);
+      const beforeDesign = await f.snapshot();
+      const designRejected = await approve(`design: unchanged ${deliveredSha}`, designHeaders).expect(422);
+      expect(designRejected.body.details?.code).toBe("approval_comment_pattern_mismatch");
+      expect((await f.snapshot()).decisions).toEqual(beforeDesign.decisions);
+      const { body: done } = await approve(
+        `design-control: qa/design-control/${f.identifier}.md соответствует`, designHeaders,
+      ).expect(200);
+      expect(done).toMatchObject({
+        status: "done", executionState: { completedStageIds: [review.id, delivery.id, verification.id, control.id] },
+      });
+    }
+  });
+
+  it("rejects narrower and unrelated routes before consuming the CEO answer", async () => {
+    const ui = await fixture("product-ui");
+    const product = await fixture();
+    // The saved policy on this protected issue deliberately lacks a design stage.
+    const protectedIssue = await fixture("lea-2039");
+    const mismatch = "issue_review_resubmission_route_mismatch";
+    const missing = "issue_review_resubmission_ceo_response_required";
+    await product.rejectWithoutWrites(422, mismatch, { ...product.body, route: "product-ui" });
+    for (const f of [ui, protectedIssue]) {
+      await f.setAnswer(answer(f.marker));
+      await f.rejectWithoutWrites(422, mismatch, { ...f.body, route: undefined });
+      await f.rejectWithoutWrites(403, missing, { ...f.body, route: "product-ui" });
+      await f.setAnswer(answer(`${f.marker} route=product`));
+      await f.rejectWithoutWrites(422, mismatch, { ...f.body, route: "product" });
+      await f.rejectWithoutWrites(403, missing, { ...f.body, route: "product-ui" });
+      await f.setAnswer(answer(`${f.marker} route=product-ui`));
+    }
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, designer));
+    try {
+      await ui.rejectWithoutWrites(409, "issue_review_resubmission_route_unavailable");
+    } finally {
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, designer));
+    }
+    await ui.call().expect(200);
+    await protectedIssue.call({ ...protectedIssue.body, route: "product-ui" }).expect(200);
   });
 
   it("rolls back the receipt, wake, comment and route when the final activity write fails", async () => {
-    const f = await fixture();
+    const f = await fixture("product-ui");
     await db.execute(sql`
       create function reject_review_resubmission_activity() returns trigger language plpgsql as $$
       begin
@@ -393,11 +461,12 @@ describePostgres("resubmit a Cards review via HTTP", () => {
     await f.rejectWithoutWrites(422, "issue_review_resubmission_comment_mismatch", {
       ...f.body, comment: `submitted: ${sha} branch=pc/${other.identifier}`,
     });
-    await f.call().expect(200);
+    await f.setAnswer(answer(`${f.marker} route=product`));
+    await f.call({ ...f.body, route: "product" }).expect(200);
   });
 
   it("requires the stored historical permission text on its exact interaction", async () => {
-    const f = await fixture(true);
+    const f = await fixture("historical");
     await f.setAnswer(answer("Отказываю в новом проходе."));
     await f.rejectWithoutWrites(403, "issue_review_resubmission_ceo_response_required");
     await f.setAnswer(answer(f.marker));

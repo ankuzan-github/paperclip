@@ -12,10 +12,16 @@ export type ResubmitIssueExecutionReview = z.infer<typeof resubmitIssueExecution
 const CARDS_COMPANY_ID = "bf0903fa-e62e-4dd2-b19b-5cacaa541460";
 const CARDS_PROJECT_ID = "8fd59ee4-3ccf-44c2-b149-5d678ce5b985";
 const CARDS_CEO_ID = "9cadde33-aa45-4828-b66e-e99cb4d33212";
+const PRODUCT_DESIGNER_ID = "f7094a71-a3c4-421d-877a-e1480058da0f";
+// The CEO's product-ui requirement for LEA-2039 survives changes to its old policy.
+const FULL_RESUBMISSION_ISSUE_ID = "f329e062-013a-40e6-843a-91490c8515b8";
 const RETURN_CEILING = 3;
 const REVIEW_PATTERN = "^reviewed: [0-9a-f]{40}";
 const DELIVERY_PATTERN = "^delivery: from=[0-9a-f]{40} to=[0-9a-f]{40} reviewed=[0-9a-f]{40}";
 const QA_PATTERN = "^verified: [0-9a-f]{40}";
+const FULL_QA_PATTERN = "^verified: [0-9a-f]{40} depth=full$";
+const DESIGN_PATTERN = "^design-control: qa/design-control/LEA-\\d+\\.md соответствует";
+const LIGHT_DESIGN_PATTERN = "^(?:" + DESIGN_PATTERN.slice(1) + "|design: unchanged [0-9a-f]{40})";
 const HISTORICAL = {
   issueId: "fcc11975-dfac-4d12-8b49-6f90182b3462",
   identifier: "LEA-2049",
@@ -70,7 +76,7 @@ export async function prepareIssueReviewResubmission(
   request: ResubmitIssueExecutionReview,
   actor: { agentId: string; runId: string },
 ) {
-  const { stageId, returnDecisionId, ceoInteractionId, reviewedSha } = request;
+  const { stageId, returnDecisionId, ceoInteractionId, reviewedSha, route } = request;
   const identifier = issue.identifier;
   if (issue.companyId !== CARDS_COMPANY_ID || issue.projectId !== CARDS_PROJECT_ID ||
     !identifier || !/^LEA-\d+$/.test(identifier)) {
@@ -125,6 +131,18 @@ export async function prepareIssueReviewResubmission(
     throw conflict("The return ceiling has not been reached", { code: "issue_review_resubmission_below_ceiling" });
   }
 
+  const requiresDesign = issue.id === FULL_RESUBMISSION_ISSUE_ID || policy.data?.stages.some((candidate) =>
+    candidate.approvalCommentPattern === DESIGN_PATTERN || candidate.approvalCommentPattern === LIGHT_DESIGN_PATTERN ||
+    candidate.participants.some((member) => member.type === "agent" && member.agentId === PRODUCT_DESIGNER_ID),
+  );
+  const expectedRoute = requiresDesign ? "product-ui" : "product";
+  if (route !== expectedRoute) {
+    throw unprocessable("The resubmission route must match the required Cards route", {
+      code: "issue_review_resubmission_route_mismatch",
+      expectedRoute,
+    });
+  }
+
   const [interaction] = await tx.select({
     result: issueThreadInteractions.result,
     idempotencyKey: issueThreadInteractions.idempotencyKey,
@@ -143,15 +161,15 @@ export async function prepareIssueReviewResubmission(
   const answer = answers.length === 1 ? answers[0]?.otherText : null;
   const marker = `pc-resubmit-review: ${identifier} return=${returnDecisionId} sha=${reviewedSha}`;
   const authorized = ceoInteractionId === HISTORICAL.ceoInteractionId
-    ? issue.id === HISTORICAL.issueId && identifier === HISTORICAL.identifier &&
+    ? route === "product" && issue.id === HISTORICAL.issueId && identifier === HISTORICAL.identifier &&
       returnDecisionId === HISTORICAL.returnDecisionId && reviewedSha === HISTORICAL.sha &&
       interaction?.idempotencyKey === `review-ceiling:${issue.id}:${returnDecisionId}:${reviewedSha}` &&
       answer?.split("\n\n", 1)[0] === HISTORICAL_APPROVAL
-    : answer?.trim() === marker;
+    : answer?.trim() === `${marker} route=${route}` || (route === "product" && answer?.trim() === marker);
   if (!interaction?.resolvedAt || interaction.createdAt < latest.createdAt || interaction.resolvedAt < interaction.createdAt ||
     !result.success || result.data.outcome || result.data.cancelled ||
     !authorized) {
-    throw forbidden("A confirmed CEO response for this issue, return and SHA is required", {
+    throw forbidden("A confirmed CEO response for this issue, return, SHA and route is required", {
       code: "issue_review_resubmission_ceo_response_required",
     });
   }
@@ -184,6 +202,7 @@ export async function prepareIssueReviewResubmission(
       eq(agents.role, "qa"),
       and(eq(agents.role, "engineer"), ilike(agents.name, "%architect%")),
       and(eq(agents.role, "engineer"), eq(agents.id, actor.agentId), ilike(agents.name, "%fullstack%")),
+      route === "product-ui" ? and(eq(agents.role, "designer"), eq(agents.id, PRODUCT_DESIGNER_ID)) : undefined,
     ),
   )).for("share");
   const fullstack = routeAgents.find((agent) => agent.id === actor.agentId && agent.role === "engineer" &&
@@ -196,6 +215,12 @@ export async function prepareIssueReviewResubmission(
   if (architects.length !== 1 || qaAgents.length !== 1 || !architect || !qa ||
     !isHeartbeatWakeOnDemandEnabled(architect)) {
     throw conflict("The Cards review route requires one available Architect and QA agent", {
+      code: "issue_review_resubmission_route_unavailable",
+    });
+  }
+  const designer = routeAgents.find((agent) => agent.id === PRODUCT_DESIGNER_ID && agent.role === "designer");
+  if (route === "product-ui" && !designer) {
+    throw conflict("The Cards product-ui route requires the available Product Designer", {
       code: "issue_review_resubmission_route_unavailable",
     });
   }
@@ -212,7 +237,8 @@ export async function prepareIssueReviewResubmission(
     stages: [
       makeStage("review", architect.id, REVIEW_PATTERN),
       makeStage("delivery", fullstack.id, DELIVERY_PATTERN),
-      makeStage("review", qa.id, QA_PATTERN),
+      makeStage("review", qa.id, requiresDesign ? FULL_QA_PATTERN : QA_PATTERN),
+      ...(designer ? [makeStage("review", designer.id, DESIGN_PATTERN)] : []),
     ],
   })!;
   const monitor = applyIssueMonitorPolicyTransition({

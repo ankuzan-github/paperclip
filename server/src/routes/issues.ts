@@ -14868,6 +14868,7 @@ export function issueRoutes(
         const reviewResubmission = resubmission && {
           ...evidence,
           reviewedSha: resubmission.reviewedSha,
+          route: resubmission.route,
           reviewStageId: nextState?.currentStageId,
         };
         if (reviewResubmission) {

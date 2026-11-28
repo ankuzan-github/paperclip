@@ -9,7 +9,7 @@ import { assertIssueReturnRunOwner } from "./issue-return-run.js";
 export type ResumeIssueExecutionStage = z.infer<typeof resumeIssueExecutionStageSchema>;
 
 const CARDS_CEO_ID = "9cadde33-aa45-4828-b66e-e99cb4d33212";
-const CARDS_QA_APPROVAL_PATTERN = "^verified: [0-9a-f]{40}";
+const CARDS_QA_APPROVAL_PATTERNS = new Set(["^verified: [0-9a-f]{40}", "^verified: [0-9a-f]{40} depth=full$"]);
 const HISTORICAL_QA_RESUME = {
   identifier: "LEA-1880",
   returnDecisionId: "ec1c4b0c-4bb0-4a7c-a6b4-927678af5d47",
@@ -48,7 +48,8 @@ export async function prepareIssueQaResume(
     state.currentStageId !== request.stageId || state.lastDecisionId !== request.returnDecisionId ||
     state.currentStageType !== "review" || state.completedStageIds.includes(request.stageId) ||
     state.returnAssignee?.type !== "agent" || state.returnAssignee.agentId !== actor.agentId ||
-    stage?.id !== request.stageId || stage.type !== "review" || stage.approvalCommentPattern !== CARDS_QA_APPROVAL_PATTERN ||
+    stage?.id !== request.stageId || stage.type !== "review" ||
+    !CARDS_QA_APPROVAL_PATTERNS.has(stage.approvalCommentPattern ?? "") ||
     participant?.type !== "agent" || !participant.agentId || participant.agentId === actor.agentId ||
     !stage.participants.some((candidate) => candidate.type === "agent" && candidate.agentId === participant.agentId)) {
     throw issueQaResumeSnapshotChanged();

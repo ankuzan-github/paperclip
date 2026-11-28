@@ -1031,6 +1031,7 @@ export const resumeIssueExecutionStageSchema = z.strictObject({
 export const resubmitIssueExecutionReviewSchema = resumeIssueExecutionStageSchema.extend({
   ceoInteractionId: resumeIssueExecutionStageSchema.shape.ceoInteractionId.transform((id) => id.toLowerCase()),
   reviewedSha: z.string().regex(/^[0-9a-f]{40}$/),
+  route: z.enum(["product", "product-ui"]).default("product"),
   comment: resumeIssueExecutionStageSchema.shape.comment.transform((body) => body.replaceAll("\r\n", "\n")),
 });
 

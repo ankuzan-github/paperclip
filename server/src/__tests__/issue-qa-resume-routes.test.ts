@@ -181,8 +181,10 @@ describePostgres("resume saved Cards QA via HTTP", () => {
     return { issueId, runId, marker, answer, executionPolicy, executionState, body, path, authorization, resume, snapshot };
   }
 
-  it("advertises PATCH on OPTIONS and atomically saves the resumed stage and one QA wake", async () => {
-    const f = await fixture();
+  it.each([
+    "^verified: [0-9a-f]{40}", "^verified: [0-9a-f]{40} depth=full$",
+  ])("atomically resumes the saved QA stage with pattern %s and one wake", async (stagePattern) => {
+    const f = await fixture({ stagePattern });
     const options = await request(app).options(f.path).expect(200);
     expect(options.headers.allow).toContain("PATCH");
     const blockerId = randomUUID();
